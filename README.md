@@ -123,10 +123,10 @@ streamlit run app/app.py
 
 ## Author
 
-**Washington Medina**  
+**Washington Casamen Nolasco**  
 Psychologist · Behavioral Data Scientist  
 Specialization: Psychometrics, IRT, People Analytics, Bayesian Modeling  
-[GitHub](https://github.com/Washingtonwlad) · [Upwork](#) · [LinkedIn](#)
+[GitHub](https://github.com/Washingtonwlad)
 
 ---
 
