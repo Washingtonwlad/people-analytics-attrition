@@ -52,18 +52,20 @@ people-analytics-attrition/
 ├── requirements.txt
 │
 ├── notebooks/
-│   └── 01_exploratory_analysis.ipynb   # Narrative EDA with organizational interpretation
+│   ├── 01_exploratory_analysis.ipynb      # Narrative EDA with organizational interpretation
+│   ├── 02_behavioral_segmentation.ipynb   # K-Means behavioral profiling (k=4)
+│   └── 03_predictive_modeling.ipynb       # XGBoost + SHAP interpretable prediction
 │
 ├── src/
-│   ├── preprocessing.py                # Cleaning and feature engineering
-│   ├── clustering.py                   # Behavioral segmentation
-│   └── modeling.py                     # Prediction pipeline + SHAP
+│   ├── preprocessing.py                   # Cleaning and feature engineering
+│   ├── clustering.py                      # Behavioral segmentation pipeline
+│   └── modeling.py                        # Prediction pipeline + SHAP
 │
 ├── app/
-│   └── app.py                          # Streamlit interactive dashboard
+│   └── app.py                             # Streamlit interactive dashboard
 │
 ├── reports/
-│   └── figures/                        # Exported visualizations
+│   └── figures/                           # Exported visualizations
 │
 └── data/
     └── raw/
