@@ -4,7 +4,17 @@
 ![Scikit-learn](https://img.shields.io/badge/Scikit--learn-1.3%2B-orange?logo=scikit-learn)
 ![Streamlit](https://img.shields.io/badge/Streamlit-1.3%2B-red?logo=streamlit)
 ![License](https://img.shields.io/badge/License-MIT-green)
-![Status](https://img.shields.io/badge/Status-In%20Progress-yellow)
+![Status](https://img.shields.io/badge/Status-Complete-brightgreen)
+
+## Dashboard Preview
+
+### Workforce Overview & Behavioral Profiles
+![Dashboard Preview 1](reports/figures/dashboard_preview_1.png)
+
+### Individual Risk Explorer
+![Dashboard Preview 2](reports/figures/dashboard_preview_2.png)
+
+> **Live demo:** run locally with `streamlit run app/app.py`
 
 > **Can we identify not just *who* will leave, but *why* — and what kind of organizational intervention each risk profile requires?**
 

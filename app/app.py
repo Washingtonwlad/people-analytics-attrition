@@ -19,8 +19,8 @@ st.set_page_config(
 )
 
 # --- Estilos globales ---
-sns.set_theme(style='whitegrid', palette='muted', font_scale=0.85)
-plt.rcParams['figure.dpi'] = 100
+sns.set_theme(style='whitegrid', palette='muted', font_scale=0.8)
+plt.rcParams['figure.dpi'] = 90
 
 # --- Carga y procesamiento de datos ---
 @st.cache_data
@@ -43,7 +43,6 @@ def run_clustering(df):
     df_scaled = scaler.fit_transform(df[clustering_vars])
     kmeans = KMeans(n_clusters=4, random_state=42, n_init=10)
     df['Cluster'] = kmeans.fit_predict(df_scaled)
-
     profile_names = {
         0: 'Strained but Present',
         1: 'Structurally Stable, Relationally Distant',
@@ -73,9 +72,10 @@ def train_model(df):
     explainer = shap.TreeExplainer(model)
     return model, explainer, X, X_test
 
+# --- SHAP cacheado ---
 @st.cache_resource
-def compute_shap_values(_explainer, X_full):
-    return _explainer.shap_values(X_full)
+def compute_shap_values(_explainer, _X_full):
+    return _explainer.shap_values(_X_full)
 
 # --- Ejecutar todo ---
 df = load_and_prepare_data()
@@ -104,7 +104,6 @@ high_risk = (df['Profile'] == 'Overloaded at Risk').sum()
 stable = (df['Profile'] == 'Engaged and Balanced').sum()
 
 col1, col2, col3, col4 = st.columns(4)
-
 with col1:
     st.metric("Total Employees", f"{total:,}")
 with col2:
@@ -124,51 +123,53 @@ st.divider()
 # ============================================================
 # SECCIÓN 1 — GRÁFICOS DE OVERVIEW
 # ============================================================
-col_left, col_right = st.columns([3, 2])
+profile_order = [
+    'Engaged and Balanced',
+    'Structurally Stable, Relationally Distant',
+    'Strained but Present',
+    'Overloaded at Risk'
+]
+colors = ['#2ecc71', '#3498db', '#f39c12', '#e74c3c']
+
+_, col_left, col_right, _ = st.columns([0.5, 3, 2, 0.5])
 
 with col_left:
     st.subheader("Attrition Rate by Behavioral Profile")
-
-    profile_order = [
-        'Engaged and Balanced',
-        'Structurally Stable, Relationally Distant',
-        'Strained but Present',
-        'Overloaded at Risk'
-    ]
     attrition_by_profile = (
         df.groupby('Profile')['AttritionBinary']
         .mean() * 100
     ).reindex(profile_order)
 
-    colors = ['#2ecc71', '#3498db', '#f39c12', '#e74c3c']
-    fig, ax = plt.subplots(figsize=(7, 3.5))
+    fig, ax = plt.subplots(figsize=(5, 2.8))
     bars = ax.barh(attrition_by_profile.index,
                    attrition_by_profile.values,
                    color=colors, edgecolor='white', height=0.5)
     ax.axvline(x=16.1, color='gray', linestyle='--',
-               linewidth=1.5, label='Global baseline (16.1%)')
-    ax.set_xlabel('Attrition rate (%)')
+               linewidth=1.2, label='Global baseline (16.1%)')
+    ax.set_xlabel('Attrition rate (%)', fontsize=8)
     ax.set_xlim(0, 40)
-    ax.legend(fontsize=9)
+    ax.legend(fontsize=7)
+    ax.tick_params(labelsize=7)
     for bar, val in zip(bars, attrition_by_profile.values):
         ax.text(val + 0.5, bar.get_y() + bar.get_height() / 2,
-                f'{val:.1f}%', va='center', fontweight='bold', fontsize=9)
+                f'{val:.1f}%', va='center', fontweight='bold', fontsize=8)
     fig.tight_layout()
-    st.pyplot(fig)
+    st.pyplot(fig, use_container_width=False)
     plt.close()
 
 with col_right:
     st.subheader("Employees per Profile")
-
     count_by_profile = df['Profile'].value_counts().reindex(profile_order)
-    fig2, ax2 = plt.subplots(figsize=(4, 3.5))
+
+    fig2, ax2 = plt.subplots(figsize=(3.5, 2.8))
     ax2.barh(count_by_profile.index, count_by_profile.values,
              color=colors, edgecolor='white', height=0.5)
-    ax2.set_xlabel('Number of employees')
+    ax2.set_xlabel('Number of employees', fontsize=8)
+    ax2.tick_params(labelsize=7)
     for i, val in enumerate(count_by_profile.values):
-        ax2.text(val + 3, i, str(val), va='center', fontsize=9)
+        ax2.text(val + 3, i, str(val), va='center', fontsize=8)
     fig2.tight_layout()
-    st.pyplot(fig2)
+    st.pyplot(fig2, use_container_width=False)
     plt.close()
 
 st.divider()
@@ -221,7 +222,7 @@ selected_profile = st.selectbox(
 profile_df = df[df['Profile'] == selected_profile]
 profile_color = profile_colors[selected_profile]
 
-col_info, col_radar = st.columns([2, 3])
+_, col_info, col_radar, _ = st.columns([0.5, 2, 2.5, 0.5])
 
 with col_info:
     st.markdown(f"### {selected_profile}")
@@ -229,19 +230,14 @@ with col_info:
     st.markdown(f"**Employees:** {len(profile_df):,} ({len(profile_df)/len(df)*100:.1f}% of workforce)")
     st.markdown("---")
     st.markdown(profile_descriptions[selected_profile])
-
     st.markdown("**Key metrics:**")
     m1, m2 = st.columns(2)
     with m1:
-        st.metric("Avg Monthly Income",
-                  f"${profile_df['MonthlyIncome'].mean():,.0f}")
-        st.metric("Avg Age",
-                  f"{profile_df['Age'].mean():.1f} yrs")
+        st.metric("Avg Monthly Income", f"${profile_df['MonthlyIncome'].mean():,.0f}")
+        st.metric("Avg Age", f"{profile_df['Age'].mean():.1f} yrs")
     with m2:
-        st.metric("Overtime %",
-                  f"{profile_df['OverTimeBinary'].mean()*100:.0f}%")
-        st.metric("Avg Tenure",
-                  f"{profile_df['YearsAtCompany'].mean():.1f} yrs")
+        st.metric("Overtime %", f"{profile_df['OverTimeBinary'].mean()*100:.0f}%")
+        st.metric("Avg Tenure", f"{profile_df['YearsAtCompany'].mean():.1f} yrs")
 
 with col_radar:
     clustering_vars = [
@@ -254,12 +250,10 @@ with col_radar:
         'Relationship\nSatisfaction', 'Job\nInvolvement',
         'Work-Life\nBalance', 'OverTime'
     ]
-
     values = profile_df[clustering_vars].mean().values.tolist()
     max_vals = [4, 4, 4, 4, 4, 1]
     values_norm = [v / m for v, m in zip(values, max_vals)]
     values_norm += values_norm[:1]
-
     angles = [n / float(len(labels)) * 2 * np.pi for n in range(len(labels))]
     angles += angles[:1]
 
@@ -267,14 +261,14 @@ with col_radar:
     ax3.plot(angles, values_norm, 'o-', linewidth=2, color=profile_color)
     ax3.fill(angles, values_norm, alpha=0.25, color=profile_color)
     ax3.set_xticks(angles[:-1])
-    ax3.set_xticklabels(labels, fontsize=8)
+    ax3.set_xticklabels(labels, fontsize=7)
     ax3.set_ylim(0, 1)
     ax3.set_yticks([0.25, 0.5, 0.75, 1.0])
-    ax3.set_yticklabels(['25%', '50%', '75%', '100%'], fontsize=7)
+    ax3.set_yticklabels(['25%', '50%', '75%', '100%'], fontsize=6)
     ax3.set_title(f'Behavioral Profile — {selected_profile}',
-                  fontweight='bold', pad=20, fontsize=9)
+                  fontweight='bold', pad=15, fontsize=8)
     fig3.tight_layout()
-    st.pyplot(fig3)
+    st.pyplot(fig3, use_container_width=False)
     plt.close()
 
 st.divider()
@@ -285,7 +279,6 @@ st.divider()
 st.header("👤 Individual Risk Explorer")
 st.markdown("Select an employee to see their predicted attrition probability and SHAP explanation.")
 
-# Preparar probabilidades para todo el dataset
 df_model_full = pd.get_dummies(
     df.drop(columns=['Attrition', 'Profile']), drop_first=True
 )
@@ -294,7 +287,8 @@ X_full = X_full.reindex(columns=X.columns, fill_value=0)
 all_probs = model.predict_proba(X_full)[:, 1]
 df['AttritionProb'] = all_probs
 
-# Selector de empleado
+shap_values_full = compute_shap_values(explainer, X_full)
+
 employee_idx = st.slider(
     "Select employee index:",
     min_value=0,
@@ -307,15 +301,11 @@ employee = df.iloc[employee_idx]
 emp_prob = employee['AttritionProb']
 emp_profile = employee['Profile']
 emp_actual = employee['Attrition']
-emp_color = profile_colors[emp_profile]
 
-# Layout: métricas izquierda, waterfall derecha
-col_emp, col_waterfall = st.columns([1, 2])
+_, col_emp, col_waterfall, _ = st.columns([0.5, 1.5, 3, 0.5])
 
 with col_emp:
     st.markdown(f"### Employee #{employee_idx}")
-
-    # Barra de riesgo visual
     risk_label = (
         "🔴 High Risk" if emp_prob >= 0.5
         else "🟡 Moderate Risk" if emp_prob >= 0.25
@@ -325,10 +315,8 @@ with col_emp:
     st.progress(float(emp_prob))
     st.markdown(f"**Risk Level:** {risk_label}")
     st.markdown(f"**Actual Outcome:** {'Left ❌' if emp_actual == 'Yes' else 'Stayed ✅'}")
-    st.markdown(f"**Behavioral Profile:** :{emp_profile}")
+    st.markdown(f"**Behavioral Profile:** {emp_profile}")
     st.divider()
-
-    # Perfil del empleado
     st.markdown("**Employee characteristics:**")
     chars = {
         'Age': int(employee['Age']),
@@ -347,7 +335,6 @@ with col_waterfall:
     st.markdown("### SHAP Explanation")
     st.markdown("Variables pushing toward attrition **(red)** or retention **(blue)**")
 
-    shap_values_full = compute_shap_values(explainer, X_full)
     shap_exp = shap.Explanation(
         values=shap_values_full[employee_idx],
         base_values=explainer.expected_value,
@@ -355,16 +342,15 @@ with col_waterfall:
         feature_names=X_full.columns.tolist()
     )
 
-    fig4, ax4 = plt.subplots(figsize=(8, 5))
+    fig4, ax4 = plt.subplots(figsize=(6, 4))
     plt.sca(ax4)
     shap.plots.waterfall(shap_exp, max_display=10, show=False)
     ax4.set_title(
-        f'Employee #{employee_idx} — Risk: {emp_prob*100:.1f}% | '
-        f'Actual: {emp_actual}',
-        fontweight='bold', fontsize=9, pad=10
+        f'Employee #{employee_idx} — Risk: {emp_prob*100:.1f}% | Actual: {emp_actual}',
+        fontweight='bold', fontsize=8, pad=10
     )
     fig4.tight_layout()
-    st.pyplot(fig4)
+    st.pyplot(fig4, use_container_width=False)
     plt.close()
 
 st.divider()
