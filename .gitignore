@@ -1,0 +1,21 @@
+# Python cache and build artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+
+# Local virtual environments
+.venv/
+venv/
+env/
+
+# Jupyter local state
+.ipynb_checkpoints/
+
+# Local IDE / assistant state
+.vscode/
+.positai/
+
+# OS files
+Thumbs.db
+.DS_Store
