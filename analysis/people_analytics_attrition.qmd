@@ -1,0 +1,5178 @@
+---
+title: "People Analytics: Behavioral Indicators and Attrition"
+subtitle: "A reproducible behavioral data science analysis"
+author: "Washington Casamen Nolasco"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    code-summary: "Show code"
+    code-tools: true
+    embed-resources: true
+    theme: cosmo
+jupyter: python3
+execute:
+  echo: true
+  warning: false
+  error: false
+---
+
+## Technical summary
+
+Behavioral and organizational information is jointly useful for ranking attrition risk
+in this synthetic dataset, but the result supports a research benchmark rather than an
+automated HR decision system.
+
+- The sample contains 1,470 employees and 237 observed attrition cases (16.1%).
+- In repeated development cross-validation, behavioral and contextual logistic models
+  reach mean Average Precision of 0.411 and 0.397. Their 24-predictor union reaches
+  0.637 and improves all four evaluation metrics in every paired validation fold.
+- Nested XGBoost does not add value: mean Average Precision is 0.607 versus 0.637 for
+  the combined logistic benchmark, with worse mean Brier score and log loss.
+- The frozen combined logistic model reaches held-out Average Precision 0.583
+  (95% bootstrap interval 0.444 to 0.712), ROC-AUC 0.799 (0.717 to 0.870), and Brier
+  score 0.099 (0.075 to 0.125). The moderate development-to-test decline is reported
+  rather than optimized away.
+- Development calibration is reasonable (intercept -0.096; slope 0.920). At the
+  development-frozen descriptive threshold of 0.32, held-out precision is 0.578 and
+  recall is 0.553. Subgroup auditing identifies age as the least stable dimension, but
+  several age groups contain too few test cases for a fairness conclusion.
+
+The selected model is L2-regularized logistic regression with `C = 1`. Its transparent
+structure, better nested-validation performance, and lower complexity make it
+preferable to XGBoost for this analysis. Associations remain non-causal, the reporting
+threshold is non-operational, and the synthetic cross-sectional source limits external
+validity.
+
+## Research questions and scope
+
+The analysis addresses four questions:
+
+1. Which behavioral, job-demand, career, and organizational indicators are associated
+   with observed attrition?
+2. Do behavioral indicators add out-of-sample predictive information beyond contextual
+   variables?
+3. Does a nonlinear tree ensemble improve on an interpretable regularized logistic
+   benchmark?
+4. How well do the final probabilities discriminate and calibrate on held-out data,
+   and where does subgroup performance require further validation?
+
+The dataset is synthetic and observational. Consequently, the report evaluates
+patterns, associations, and predictive performance; it does not establish causal
+effects or justify automated employment decisions.
+
+## Analytical design and metric definitions
+
+The workflow follows nine stages:
+
+1. audit data quality and assign every source variable a conceptual role;
+2. quantify behavioral, job-demand, and contextual associations with uncertainty;
+3. reserve age, gender, and marital status for auditing rather than prediction;
+4. freeze behavioral, contextual, and combined predictor specifications;
+5. create a 20% stratified test holdout and repeated development cross-validation;
+6. compare leakage-safe logistic baselines and incremental predictor value;
+7. tune regularization, audit coefficient stability, and benchmark nested XGBoost;
+8. evaluate calibration and threshold trade-offs using out-of-fold probabilities;
+9. open the frozen test once and audit final performance and subgroups.
+
+**Average Precision** is the primary model-selection metric because attrition is the
+minority outcome and precision-recall performance depends directly on identifying that
+class. **ROC-AUC** is a secondary ranking measure. **Brier score** and **log loss**
+assess probability quality and are better when lower. Threshold-dependent precision,
+recall, specificity, and F1 are secondary decision diagnostics; accuracy is never used
+for model selection.
+
+### Key assumptions
+
+- Variables such as `JobSatisfaction` and `WorkLifeBalance` are treated as
+  ordinal attitude indicators, not as validated psychometric scales.
+- Attrition is a binary outcome observed in a synthetic educational dataset.
+- Predictive explanations describe how a model uses variables; they do not prove
+  why an employee leaves.
+- Sensitive attributes are reserved for descriptive checks and model auditing,
+  not for the primary predictive models.
+
+## 1. Reproducible setup
+
+The first cell imports only the packages needed for data inspection. More complex
+modeling libraries will be introduced when the corresponding method is used.
+
+```{python}
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from IPython.display import display
+
+RANDOM_SEED = 42
+TARGET_COLUMN = "Attrition"
+
+pd.set_option("display.max_columns", 50)
+pd.set_option("display.max_rows", 100)
+pd.set_option("display.float_format", lambda value: f"{value:,.3f}")
+
+sns.set_theme(style="whitegrid", context="notebook")
+plt.close("all")
+RETENTION_COLOR = "#2E86AB"
+ATTRITION_COLOR = "#E84855"
+```
+
+### 1.1 Locate the project safely
+
+File paths should not depend on whether the document is executed from the repository
+root, the `analysis/` directory, or an interactive Positron session. The helper below
+walks upward until it finds the expected project structure.
+
+```{python}
+def find_project_root(start: Path | None = None) -> Path:
+    """Find the repository root from any directory inside the project."""
+    start_path = Path.cwd() if start is None else Path(start)
+
+    for candidate in (start_path, *start_path.parents):
+        expected_markers = (
+            candidate / "README.md",
+            candidate / "data",
+            candidate / "src",
+        )
+        if expected_markers[0].is_file() and all(
+            marker.is_dir() for marker in expected_markers[1:]
+        ):
+            return candidate.resolve()
+
+    raise FileNotFoundError(
+        "Project root not found. Open Positron inside the repository or one of "
+        "its subdirectories."
+    )
+
+
+PROJECT_ROOT = find_project_root()
+DATA_PATH = PROJECT_ROOT / "data" / "raw" / "HR-Employee-Attrition.csv"
+
+print(f"Project root: {PROJECT_ROOT}")
+print(f"Data file:    {DATA_PATH}")
+```
+
+## 2. Load and validate the source data
+
+Loading a file successfully is not sufficient. Before analyzing it, we verify its
+schema, target coding, and employee identifier. These checks make failures explicit
+if the source file is replaced or modified in the future.
+
+```{python}
+EXPECTED_COLUMNS = [
+    "Age",
+    "Attrition",
+    "BusinessTravel",
+    "DailyRate",
+    "Department",
+    "DistanceFromHome",
+    "Education",
+    "EducationField",
+    "EmployeeCount",
+    "EmployeeNumber",
+    "EnvironmentSatisfaction",
+    "Gender",
+    "HourlyRate",
+    "JobInvolvement",
+    "JobLevel",
+    "JobRole",
+    "JobSatisfaction",
+    "MaritalStatus",
+    "MonthlyIncome",
+    "MonthlyRate",
+    "NumCompaniesWorked",
+    "Over18",
+    "OverTime",
+    "PercentSalaryHike",
+    "PerformanceRating",
+    "RelationshipSatisfaction",
+    "StandardHours",
+    "StockOptionLevel",
+    "TotalWorkingYears",
+    "TrainingTimesLastYear",
+    "WorkLifeBalance",
+    "YearsAtCompany",
+    "YearsInCurrentRole",
+    "YearsSinceLastPromotion",
+    "YearsWithCurrManager",
+]
+
+if not DATA_PATH.is_file():
+    raise FileNotFoundError(f"Expected data file was not found: {DATA_PATH}")
+
+raw_df = pd.read_csv(DATA_PATH)
+
+missing_columns = sorted(set(EXPECTED_COLUMNS) - set(raw_df.columns))
+unexpected_columns = sorted(set(raw_df.columns) - set(EXPECTED_COLUMNS))
+
+if missing_columns or unexpected_columns:
+    raise ValueError(
+        "Unexpected source schema. "
+        f"Missing columns: {missing_columns}; "
+        f"unexpected columns: {unexpected_columns}."
+    )
+
+target_levels = set(raw_df[TARGET_COLUMN].dropna().unique())
+if target_levels != {"No", "Yes"}:
+    raise ValueError(
+        f"Attrition must contain exactly 'No' and 'Yes'; found {target_levels}."
+    )
+
+if not raw_df["EmployeeNumber"].is_unique:
+    raise ValueError("EmployeeNumber is not unique; investigate duplicated employees.")
+
+print(f"Validated {raw_df.shape[0]:,} rows and {raw_df.shape[1]} columns.")
+```
+
+### 2.1 Data preview
+
+The preview is intentionally bounded. It confirms that the file was parsed correctly
+without flooding the report with all 35 columns.
+
+```{python}
+preview_columns = [
+    "EmployeeNumber",
+    "Attrition",
+    "JobSatisfaction",
+    "JobInvolvement",
+    "WorkLifeBalance",
+    "OverTime",
+    "JobRole",
+    "YearsAtCompany",
+]
+
+display(raw_df.loc[:, preview_columns].head())
+```
+
+## 3. Data-quality audit
+
+The audit answers five basic questions: how many observations exist, whether cells
+are missing, whether rows or employee identifiers are duplicated, and how frequent
+attrition is. These checks precede any visualization or model.
+
+```{python}
+attrition_counts = raw_df[TARGET_COLUMN].value_counts()
+attrition_rate = raw_df[TARGET_COLUMN].eq("Yes").mean()
+
+data_audit = pd.DataFrame(
+    {
+        "metric": [
+            "Rows",
+            "Columns",
+            "Missing cells",
+            "Duplicated rows",
+            "Unique employee identifiers",
+            "Employees with attrition",
+            "Attrition rate",
+        ],
+        "value": [
+            raw_df.shape[0],
+            raw_df.shape[1],
+            int(raw_df.isna().sum().sum()),
+            int(raw_df.duplicated().sum()),
+            raw_df["EmployeeNumber"].nunique(),
+            int(attrition_counts.get("Yes", 0)),
+            f"{attrition_rate:.1%}",
+        ],
+    }
+)
+
+display(data_audit)
+```
+
+### 3.1 Constant columns
+
+A constant variable has no variance and therefore cannot explain or predict any
+difference between employees. We detect constants from the data rather than relying
+only on prior knowledge.
+
+```{python}
+detected_constant_columns = raw_df.columns[
+    raw_df.nunique(dropna=False).eq(1)
+].tolist()
+
+constant_summary = pd.DataFrame(
+    {
+        "variable": detected_constant_columns,
+        "constant_value": [
+            raw_df[column].iloc[0] for column in detected_constant_columns
+        ],
+    }
+)
+
+display(constant_summary)
+```
+
+## 4. Conceptual variable taxonomy
+
+Predictive software will use any available column, whether or not that column has a
+defensible meaning. The taxonomy below prevents that behavior by assigning every
+variable a conceptual block and a permitted analytical role before modeling begins.
+
+```{python}
+VARIABLE_GROUPS = [
+    {
+        "variables": ["Attrition"],
+        "conceptual_block": "Outcome",
+        "measurement": "Binary categorical",
+        "modeling_role": "Target",
+        "rationale": "Observed attrition outcome: Yes or No.",
+    },
+    {
+        "variables": [
+            "EnvironmentSatisfaction",
+            "JobInvolvement",
+            "JobSatisfaction",
+            "RelationshipSatisfaction",
+            "WorkLifeBalance",
+        ],
+        "conceptual_block": "Behavioral and attitudinal indicators",
+        "measurement": "Ordinal, four response levels",
+        "modeling_role": "Behavioral candidate",
+        "rationale": (
+            "Single-item attitude indicators; they are not treated as validated scales."
+        ),
+    },
+    {
+        "variables": ["BusinessTravel", "DistanceFromHome", "OverTime"],
+        "conceptual_block": "Job demands",
+        "measurement": "Mixed categorical and numeric",
+        "modeling_role": "Behavioral candidate",
+        "rationale": "Observable conditions that may represent workload or strain.",
+    },
+    {
+        "variables": [
+            "NumCompaniesWorked",
+            "TotalWorkingYears",
+            "TrainingTimesLastYear",
+            "YearsAtCompany",
+            "YearsInCurrentRole",
+            "YearsSinceLastPromotion",
+            "YearsWithCurrManager",
+        ],
+        "conceptual_block": "Career and organizational tenure",
+        "measurement": "Count or duration",
+        "modeling_role": "Contextual candidate",
+        "rationale": "Describes career history and current organizational attachment.",
+    },
+    {
+        "variables": [
+            "Department",
+            "JobLevel",
+            "JobRole",
+            "MonthlyIncome",
+            "PercentSalaryHike",
+            "PerformanceRating",
+            "StockOptionLevel",
+        ],
+        "conceptual_block": "Organizational context",
+        "measurement": "Mixed categorical, ordinal, and numeric",
+        "modeling_role": "Contextual candidate",
+        "rationale": "Describes job structure, compensation, and organizational position.",
+    },
+    {
+        "variables": ["Education", "EducationField"],
+        "conceptual_block": "Educational background",
+        "measurement": "Ordinal and categorical",
+        "modeling_role": "Contextual candidate",
+        "rationale": "Background information considered separately from job experience.",
+    },
+    {
+        "variables": ["Age", "Gender", "MaritalStatus"],
+        "conceptual_block": "Sensitive or personal attributes",
+        "measurement": "Mixed numeric and categorical",
+        "modeling_role": "Audit only",
+        "rationale": (
+            "Reserved for descriptive and subgroup performance audits, not the primary model."
+        ),
+    },
+    {
+        "variables": ["DailyRate", "HourlyRate", "MonthlyRate"],
+        "conceptual_block": "Ambiguous rate variables",
+        "measurement": "Numeric",
+        "modeling_role": "Excluded pending definition",
+        "rationale": (
+            "Construct meaning is unclear and must be verified before analytical use."
+        ),
+    },
+    {
+        "variables": ["EmployeeNumber"],
+        "conceptual_block": "Identifier",
+        "measurement": "Unique identifier",
+        "modeling_role": "Excluded",
+        "rationale": "An identifier has no substantive predictive meaning.",
+    },
+    {
+        "variables": ["EmployeeCount", "Over18", "StandardHours"],
+        "conceptual_block": "Constant metadata",
+        "measurement": "Constant",
+        "modeling_role": "Excluded",
+        "rationale": "No variance; cannot explain differences between employees.",
+    },
+]
+
+taxonomy_rows = []
+for group in VARIABLE_GROUPS:
+    for variable in group["variables"]:
+        taxonomy_rows.append(
+            {
+                "variable": variable,
+                "conceptual_block": group["conceptual_block"],
+                "measurement": group["measurement"],
+                "modeling_role": group["modeling_role"],
+                "rationale": group["rationale"],
+            }
+        )
+
+variable_taxonomy = (
+    pd.DataFrame(taxonomy_rows)
+    .sort_values(["modeling_role", "conceptual_block", "variable"])
+    .reset_index(drop=True)
+)
+
+duplicated_taxonomy_variables = variable_taxonomy.loc[
+    variable_taxonomy["variable"].duplicated(), "variable"
+].tolist()
+unclassified_variables = sorted(set(raw_df.columns) - set(variable_taxonomy["variable"]))
+taxonomy_only_variables = sorted(set(variable_taxonomy["variable"]) - set(raw_df.columns))
+
+if duplicated_taxonomy_variables or unclassified_variables or taxonomy_only_variables:
+    raise ValueError(
+        "Variable taxonomy is incomplete or duplicated. "
+        f"Duplicates: {duplicated_taxonomy_variables}; "
+        f"unclassified: {unclassified_variables}; "
+        f"not in source: {taxonomy_only_variables}."
+    )
+
+display(variable_taxonomy)
+```
+
+### 4.1 Taxonomy summary
+
+```{python}
+taxonomy_summary = (
+    variable_taxonomy.groupby(["modeling_role", "conceptual_block"], as_index=False)
+    .agg(n_variables=("variable", "count"))
+    .sort_values(["modeling_role", "conceptual_block"])
+)
+
+display(taxonomy_summary)
+```
+
+## 5. Create the analysis table
+
+We preserve `raw_df` unchanged and create a separate analytical table. Identifiers,
+constants, and variables with unclear construct meaning are removed. The outcome is
+encoded as 1 for attrition and 0 for retention while the original label is retained
+for readable tables and plots.
+
+```{python}
+excluded_roles = {"Excluded", "Excluded pending definition"}
+excluded_columns = variable_taxonomy.loc[
+    variable_taxonomy["modeling_role"].isin(excluded_roles), "variable"
+].tolist()
+
+analysis_df = raw_df.drop(columns=excluded_columns).copy()
+analysis_df["AttritionBinary"] = analysis_df[TARGET_COLUMN].map(
+    {"No": 0, "Yes": 1}
+)
+
+if analysis_df["AttritionBinary"].isna().any():
+    raise ValueError("AttritionBinary contains missing values after target encoding.")
+
+analysis_table_summary = pd.DataFrame(
+    {
+        "metric": [
+            "Rows",
+            "Source columns",
+            "Excluded source columns",
+            "Analysis columns including encoded target",
+            "Attrition rate",
+        ],
+        "value": [
+            len(analysis_df),
+            raw_df.shape[1],
+            len(excluded_columns),
+            analysis_df.shape[1],
+            f"{analysis_df['AttritionBinary'].mean():.1%}",
+        ],
+    }
+)
+
+display(analysis_table_summary)
+print("Excluded columns:", ", ".join(excluded_columns))
+```
+
+## Checks and interpretation
+
+The source contains 1,470 unique employee records and 35 variables. The expected
+attrition prevalence is approximately 16%, so accuracy alone will be misleading:
+a model that predicts retention for every employee would already appear highly
+accurate. Later phases will therefore emphasize precision-recall performance and
+calibration.
+
+The taxonomy also establishes an important design constraint: identifiers and
+constant columns are removed, ambiguous rate variables are withheld pending a clear
+definition, and sensitive attributes are not included in the primary prediction
+models.
+
+## 6. Attrition prevalence and uncertainty
+
+The observed attrition rate is a sample proportion. A confidence interval communicates
+the range of population proportions that remain compatible with the observed data
+under repeated sampling. We use a Wilson interval because it behaves better than the
+simple normal approximation for binary proportions.
+
+```{python}
+def wilson_interval(
+    successes: int,
+    total: int,
+    z_value: float = 1.959964,
+) -> tuple[float, float]:
+    """Calculate a two-sided Wilson confidence interval for a proportion."""
+    if total <= 0:
+        raise ValueError("The total number of observations must be positive.")
+
+    proportion = successes / total
+    denominator = 1 + (z_value**2 / total)
+    center = (
+        proportion + (z_value**2 / (2 * total))
+    ) / denominator
+    margin = (
+        z_value
+        * np.sqrt(
+            (proportion * (1 - proportion) / total)
+            + (z_value**2 / (4 * total**2))
+        )
+        / denominator
+    )
+    return center - margin, center + margin
+
+
+n_employees = len(analysis_df)
+n_attrition = int(analysis_df["AttritionBinary"].sum())
+attrition_proportion = n_attrition / n_employees
+attrition_ci_low, attrition_ci_high = wilson_interval(
+    successes=n_attrition,
+    total=n_employees,
+)
+
+majority_class_accuracy = max(
+    attrition_proportion,
+    1 - attrition_proportion,
+)
+
+outcome_summary = pd.DataFrame(
+    {
+        "metric": [
+            "Employees",
+            "Attrition cases",
+            "Observed attrition rate",
+            "Wilson 95% CI - lower",
+            "Wilson 95% CI - upper",
+            "Accuracy of always predicting the majority class",
+        ],
+        "value": [
+            n_employees,
+            n_attrition,
+            f"{attrition_proportion:.1%}",
+            f"{attrition_ci_low:.1%}",
+            f"{attrition_ci_high:.1%}",
+            f"{majority_class_accuracy:.1%}",
+        ],
+    }
+)
+
+display(outcome_summary)
+```
+
+### 6.1 Outcome distribution
+
+```{python}
+outcome_plot_data = (
+    analysis_df[TARGET_COLUMN]
+    .value_counts()
+    .reindex(["No", "Yes"])
+    .rename_axis("Attrition")
+    .reset_index(name="employees")
+)
+outcome_plot_data["percentage"] = (
+    outcome_plot_data["employees"] / outcome_plot_data["employees"].sum() * 100
+)
+
+fig, ax = plt.subplots(figsize=(7, 4.5))
+bars = ax.bar(
+    outcome_plot_data["Attrition"],
+    outcome_plot_data["percentage"],
+    color=[RETENTION_COLOR, ATTRITION_COLOR],
+    width=0.65,
+)
+
+for bar, count, percentage in zip(
+    bars,
+    outcome_plot_data["employees"],
+    outcome_plot_data["percentage"],
+):
+    ax.text(
+        bar.get_x() + bar.get_width() / 2,
+        bar.get_height() + 1.5,
+        f"{count:,}\n({percentage:.1f}%)",
+        ha="center",
+        va="bottom",
+        fontweight="bold",
+    )
+
+ax.set(
+    title="Employee attrition is an imbalanced outcome",
+    xlabel="Observed attrition",
+    ylabel="Employees (%)",
+    ylim=(0, 95),
+)
+sns.despine(ax=ax)
+plt.tight_layout()
+plt.show()
+plt.close(fig)
+```
+
+The majority-class baseline is not a useful model, but it is a necessary reference.
+Any classifier that predicts `No` for every employee will achieve high accuracy while
+identifying none of the employees who left. This is why later model evaluation will
+prioritize precision-recall performance, calibration, and class-specific errors.
+
+## 7. Behavioral and attitudinal indicators
+
+The five attitude indicators use four ordered response levels. Treating these values
+as ordinal means that a score of 4 represents more of the attribute than a score of 3,
+but it does not guarantee that the distance from 1 to 2 is psychologically identical
+to the distance from 3 to 4.
+
+### 7.1 Validate ordinal response levels
+
+```{python}
+ATTITUDE_INDICATORS = [
+    "EnvironmentSatisfaction",
+    "JobInvolvement",
+    "JobSatisfaction",
+    "RelationshipSatisfaction",
+    "WorkLifeBalance",
+]
+
+ATTITUDE_LABELS = {
+    "EnvironmentSatisfaction": "Environment satisfaction",
+    "JobInvolvement": "Job involvement",
+    "JobSatisfaction": "Job satisfaction",
+    "RelationshipSatisfaction": "Relationship satisfaction",
+    "WorkLifeBalance": "Work-life balance",
+}
+
+expected_ordinal_levels = {1, 2, 3, 4}
+ordinal_checks = []
+
+for variable in ATTITUDE_INDICATORS:
+    observed_levels = set(analysis_df[variable].dropna().unique())
+    ordinal_checks.append(
+        {
+            "variable": variable,
+            "observed_levels": sorted(observed_levels),
+            "missing_values": int(analysis_df[variable].isna().sum()),
+            "valid_four_level_item": observed_levels == expected_ordinal_levels,
+        }
+    )
+
+ordinal_check_table = pd.DataFrame(ordinal_checks)
+
+if not ordinal_check_table["valid_four_level_item"].all():
+    invalid_items = ordinal_check_table.loc[
+        ~ordinal_check_table["valid_four_level_item"], "variable"
+    ].tolist()
+    raise ValueError(f"Unexpected ordinal response levels in: {invalid_items}")
+
+display(ordinal_check_table)
+```
+
+### 7.2 Group summaries
+
+Means are included because they provide a compact comparison and are common in
+organizational research. Medians and response-category percentages remain visible
+because the indicators are ordinal.
+
+```{python}
+attitude_long = analysis_df.melt(
+    id_vars=[TARGET_COLUMN],
+    value_vars=ATTITUDE_INDICATORS,
+    var_name="indicator",
+    value_name="score",
+)
+attitude_long["group"] = attitude_long[TARGET_COLUMN].map(
+    {"No": "Stayed", "Yes": "Left"}
+)
+
+attitude_group_summary = (
+    attitude_long.groupby(["indicator", "group"], observed=True)
+    .agg(
+        n=("score", "size"),
+        mean=("score", "mean"),
+        median=("score", "median"),
+        standard_deviation=("score", "std"),
+        low_score_percentage=("score", lambda values: values.le(2).mean() * 100),
+        high_score_percentage=("score", lambda values: values.ge(3).mean() * 100),
+    )
+    .reset_index()
+    .sort_values(["indicator", "group"])
+)
+
+display(attitude_group_summary)
+```
+
+### 7.3 Response distributions
+
+The small multiples below preserve all four response categories. This helps us see
+whether a mean difference reflects a broad distributional shift or only a difference
+in one response category.
+
+```{python}
+attitude_distribution = (
+    attitude_long.groupby(["indicator", "group", "score"], observed=True)
+    .size()
+    .rename("n")
+    .reset_index()
+)
+attitude_distribution["percentage_within_group"] = (
+    attitude_distribution.groupby(["indicator", "group"], observed=True)["n"]
+    .transform(lambda counts: counts / counts.sum() * 100)
+)
+
+fig, axes = plt.subplots(2, 3, figsize=(14, 8), sharex=True, sharey=True)
+axes = axes.flatten()
+
+for ax, indicator in zip(axes, ATTITUDE_INDICATORS):
+    indicator_data = attitude_distribution.loc[
+        attitude_distribution["indicator"].eq(indicator)
+    ]
+    sns.barplot(
+        data=indicator_data,
+        x="score",
+        y="percentage_within_group",
+        hue="group",
+        hue_order=["Stayed", "Left"],
+        palette={"Stayed": RETENTION_COLOR, "Left": ATTRITION_COLOR},
+        ax=ax,
+    )
+    ax.set_title(ATTITUDE_LABELS[indicator])
+    ax.set_xlabel("Response level")
+    ax.set_ylabel("Employees within group (%)")
+    ax.legend_.remove()
+
+axes[-1].axis("off")
+handles, labels = axes[0].get_legend_handles_labels()
+fig.legend(
+    handles,
+    labels,
+    title="Observed outcome",
+    loc="lower right",
+    bbox_to_anchor=(0.92, 0.12),
+)
+fig.suptitle(
+    "Attitude-item distributions by observed attrition",
+    fontsize=16,
+    y=1.02,
+)
+plt.tight_layout()
+plt.show()
+plt.close(fig)
+```
+
+### 7.4 Ordinal effect size: Cliff's delta
+
+Cliff's delta is defined as:
+
+$$
+\delta = P(X_{left} > X_{stayed}) - P(X_{left} < X_{stayed})
+$$
+
+A negative value means that an employee who left is more likely to have a lower score
+than an employee who stayed. A value near zero indicates substantial overlap between
+the two groups. The bootstrap interval quantifies sampling uncertainty without
+requiring a normal distribution for the four-level item.
+
+```{python}
+def cliffs_delta(first_group: pd.Series, second_group: pd.Series) -> float:
+    """Calculate Cliff's delta with an efficient ordered-search algorithm."""
+    first_values = np.asarray(first_group)
+    second_values_sorted = np.sort(np.asarray(second_group))
+
+    greater_pairs = np.searchsorted(
+        second_values_sorted,
+        first_values,
+        side="left",
+    ).sum()
+    lower_pairs = (
+        len(second_values_sorted)
+        - np.searchsorted(
+            second_values_sorted,
+            first_values,
+            side="right",
+        )
+    ).sum()
+    total_pairs = len(first_values) * len(second_values_sorted)
+
+    return (greater_pairs - lower_pairs) / total_pairs
+
+
+def bootstrap_cliffs_delta(
+    first_group: pd.Series,
+    second_group: pd.Series,
+    n_bootstrap: int = 2_000,
+    confidence_level: float = 0.95,
+    random_seed: int = RANDOM_SEED,
+) -> tuple[float, float]:
+    """Bootstrap a percentile confidence interval for Cliff's delta."""
+    rng = np.random.default_rng(random_seed)
+    first_values = first_group.to_numpy()
+    second_values = second_group.to_numpy()
+    bootstrap_estimates = np.empty(n_bootstrap)
+
+    for bootstrap_index in range(n_bootstrap):
+        first_sample = rng.choice(
+            first_values,
+            size=len(first_values),
+            replace=True,
+        )
+        second_sample = rng.choice(
+            second_values,
+            size=len(second_values),
+            replace=True,
+        )
+        bootstrap_estimates[bootstrap_index] = cliffs_delta(
+            first_sample,
+            second_sample,
+        )
+
+    alpha = 1 - confidence_level
+    return tuple(
+        np.quantile(
+            bootstrap_estimates,
+            [alpha / 2, 1 - alpha / 2],
+        )
+    )
+```
+
+```{python}
+effect_size_rows = []
+
+for indicator_index, indicator in enumerate(ATTITUDE_INDICATORS):
+    scores_left = analysis_df.loc[
+        analysis_df[TARGET_COLUMN].eq("Yes"), indicator
+    ]
+    scores_stayed = analysis_df.loc[
+        analysis_df[TARGET_COLUMN].eq("No"), indicator
+    ]
+
+    delta_estimate = cliffs_delta(scores_left, scores_stayed)
+    delta_ci_low, delta_ci_high = bootstrap_cliffs_delta(
+        scores_left,
+        scores_stayed,
+        random_seed=RANDOM_SEED + indicator_index,
+    )
+
+    effect_size_rows.append(
+        {
+            "indicator": indicator,
+            "mean_left": scores_left.mean(),
+            "mean_stayed": scores_stayed.mean(),
+            "mean_difference_left_minus_stayed": (
+                scores_left.mean() - scores_stayed.mean()
+            ),
+            "cliffs_delta": delta_estimate,
+            "ci_95_low": delta_ci_low,
+            "ci_95_high": delta_ci_high,
+        }
+    )
+
+attitude_effect_sizes = (
+    pd.DataFrame(effect_size_rows)
+    .sort_values("cliffs_delta")
+    .reset_index(drop=True)
+)
+
+display(attitude_effect_sizes)
+```
+
+### 7.5 Effect-size plot
+
+```{python}
+effect_plot_data = attitude_effect_sizes.sort_values("cliffs_delta").assign(
+    indicator_label=lambda frame: frame["indicator"].map(ATTITUDE_LABELS)
+)
+
+fig, ax = plt.subplots(figsize=(9, 5.5))
+ax.errorbar(
+    x=effect_plot_data["cliffs_delta"],
+    y=effect_plot_data["indicator_label"],
+    xerr=[
+        effect_plot_data["cliffs_delta"] - effect_plot_data["ci_95_low"],
+        effect_plot_data["ci_95_high"] - effect_plot_data["cliffs_delta"],
+    ],
+    fmt="o",
+    color=ATTRITION_COLOR,
+    ecolor="#4A5568",
+    elinewidth=1.5,
+    capsize=4,
+    markersize=7,
+)
+ax.axvline(0, color="black", linestyle="--", linewidth=1)
+ax.set(
+    title="Employees who left tend to report lower attitude scores",
+    xlabel="Cliff's delta: Left compared with Stayed",
+    ylabel="",
+)
+sns.despine(ax=ax)
+plt.tight_layout()
+plt.show()
+plt.close(fig)
+```
+
+## Phase 2 interpretation checkpoint
+
+The observed attrition rate is 16.1%, with a Wilson 95% confidence interval from
+14.3% to 18.1%. Always predicting retention would therefore produce 83.9% accuracy
+while detecting no attrition cases. This demonstrates why overall accuracy cannot be
+the primary model-selection metric.
+
+All five attitude indicators have a median of 3 in both outcome groups. The identical
+medians do not imply identical distributions: medians can be insensitive to moderate
+shifts in four-level items. Employees who left reported lower mean scores on every
+indicator, but the magnitude and uncertainty differ:
+
+- `JobInvolvement` has the largest ordinal separation: $\delta=-0.165$,
+  95% bootstrap CI $[-0.238, -0.091]$.
+- `JobSatisfaction` shows $\delta=-0.156$,
+  95% bootstrap CI $[-0.231, -0.080]$.
+- `EnvironmentSatisfaction` shows $\delta=-0.146$,
+  95% bootstrap CI $[-0.221, -0.066]$.
+- `WorkLifeBalance` and `RelationshipSatisfaction` have smaller estimates, and their
+  bootstrap intervals include zero. The current data remain compatible with effects
+  close to zero for these two bivariate comparisons.
+
+These effects indicate substantial overlap between employees who stayed and those who
+left. None of the attitude indicators should be treated as an individual diagnostic
+or decision rule. The comparison is descriptive and bivariate: a non-zero effect does
+not show that an attitude indicator causes attrition. Later models will assess whether
+the indicators add predictive information after organizational context is included.
+
+## Next step
+
+The next phase examines observable job demands. Binary, categorical, and numeric
+conditions require different effect measures, so they are handled separately before
+predictive modeling begins.
+
+## 8. Observable job demands
+
+`OverTime`, `BusinessTravel`, and `DistanceFromHome` are treated as observable job
+conditions that may function as demands. They do not form a validated job-demands
+scale, and the current data cannot determine whether these conditions cause attrition.
+
+Each variable requires a different summary:
+
+- `OverTime` is binary, so we compare risks, risk difference, risk ratio, and odds ratio.
+- `BusinessTravel` has three unordered categories, so we estimate attrition within
+  each category rather than imposing a numeric trend.
+- `DistanceFromHome` is numeric and bounded, so we compare distributions and use
+  Cliff's delta without assuming normality.
+
+### 8.1 Overtime and attrition risk
+
+Risk, relative risk, and odds ratio answer related but different questions:
+
+- **Risk difference:** how many percentage points separate the groups?
+- **Risk ratio:** how many times as frequent is attrition in one group?
+- **Odds ratio:** how many times as large are the attrition odds?
+
+For non-rare outcomes, an odds ratio is usually farther from 1 than the corresponding
+risk ratio and should not be interpreted as if both were the same quantity.
+
+```{python}
+def bootstrap_risk_difference(
+    exposed_outcomes: pd.Series,
+    unexposed_outcomes: pd.Series,
+    n_bootstrap: int = 5_000,
+    confidence_level: float = 0.95,
+    random_seed: int = RANDOM_SEED,
+) -> tuple[float, float]:
+    """Bootstrap a stratified percentile interval for a risk difference."""
+    rng = np.random.default_rng(random_seed)
+    exposed_values = exposed_outcomes.to_numpy()
+    unexposed_values = unexposed_outcomes.to_numpy()
+    estimates = np.empty(n_bootstrap)
+
+    for bootstrap_index in range(n_bootstrap):
+        exposed_sample = rng.choice(
+            exposed_values,
+            size=len(exposed_values),
+            replace=True,
+        )
+        unexposed_sample = rng.choice(
+            unexposed_values,
+            size=len(unexposed_values),
+            replace=True,
+        )
+        estimates[bootstrap_index] = (
+            exposed_sample.mean() - unexposed_sample.mean()
+        )
+
+    alpha = 1 - confidence_level
+    return tuple(np.quantile(estimates, [alpha / 2, 1 - alpha / 2]))
+
+
+def binary_exposure_effects(
+    data: pd.DataFrame,
+    exposure: str,
+    exposed_value: str,
+    unexposed_value: str,
+    outcome: str = "AttritionBinary",
+    random_seed: int = RANDOM_SEED,
+) -> pd.DataFrame:
+    """Summarize binary exposure effects with interpretable uncertainty."""
+    exposed_outcomes = data.loc[data[exposure].eq(exposed_value), outcome]
+    unexposed_outcomes = data.loc[data[exposure].eq(unexposed_value), outcome]
+
+    exposed_cases = int(exposed_outcomes.sum())
+    exposed_non_cases = int(len(exposed_outcomes) - exposed_cases)
+    unexposed_cases = int(unexposed_outcomes.sum())
+    unexposed_non_cases = int(len(unexposed_outcomes) - unexposed_cases)
+
+    cell_counts = [
+        exposed_cases,
+        exposed_non_cases,
+        unexposed_cases,
+        unexposed_non_cases,
+    ]
+    if min(cell_counts) == 0:
+        raise ValueError(
+            "A zero cell was found. Add an explicit small-cell correction before "
+            "calculating ratio confidence intervals."
+        )
+
+    exposed_risk = exposed_outcomes.mean()
+    unexposed_risk = unexposed_outcomes.mean()
+    risk_difference = exposed_risk - unexposed_risk
+    risk_ratio = exposed_risk / unexposed_risk
+    odds_ratio = (
+        exposed_cases * unexposed_non_cases
+    ) / (
+        exposed_non_cases * unexposed_cases
+    )
+
+    z_value = 1.959964
+    log_risk_ratio_se = np.sqrt(
+        (1 / exposed_cases)
+        - (1 / len(exposed_outcomes))
+        + (1 / unexposed_cases)
+        - (1 / len(unexposed_outcomes))
+    )
+    risk_ratio_ci = np.exp(
+        np.log(risk_ratio)
+        + np.array([-1, 1]) * z_value * log_risk_ratio_se
+    )
+
+    log_odds_ratio_se = np.sqrt(sum(1 / count for count in cell_counts))
+    odds_ratio_ci = np.exp(
+        np.log(odds_ratio)
+        + np.array([-1, 1]) * z_value * log_odds_ratio_se
+    )
+
+    risk_difference_ci = bootstrap_risk_difference(
+        exposed_outcomes,
+        unexposed_outcomes,
+        random_seed=random_seed,
+    )
+    exposed_risk_ci = wilson_interval(exposed_cases, len(exposed_outcomes))
+    unexposed_risk_ci = wilson_interval(unexposed_cases, len(unexposed_outcomes))
+
+    return pd.DataFrame(
+        {
+            "measure": [
+                f"Risk: {exposure}={exposed_value}",
+                f"Risk: {exposure}={unexposed_value}",
+                "Risk difference",
+                "Risk ratio",
+                "Odds ratio",
+            ],
+            "estimate": [
+                exposed_risk,
+                unexposed_risk,
+                risk_difference,
+                risk_ratio,
+                odds_ratio,
+            ],
+            "ci_95_low": [
+                exposed_risk_ci[0],
+                unexposed_risk_ci[0],
+                risk_difference_ci[0],
+                risk_ratio_ci[0],
+                odds_ratio_ci[0],
+            ],
+            "ci_95_high": [
+                exposed_risk_ci[1],
+                unexposed_risk_ci[1],
+                risk_difference_ci[1],
+                risk_ratio_ci[1],
+                odds_ratio_ci[1],
+            ],
+        }
+    )
+
+
+overtime_effects = binary_exposure_effects(
+    data=analysis_df,
+    exposure="OverTime",
+    exposed_value="Yes",
+    unexposed_value="No",
+)
+
+display(overtime_effects)
+```
+
+### 8.2 Business travel
+
+```{python}
+TRAVEL_ORDER = ["Non-Travel", "Travel_Rarely", "Travel_Frequently"]
+TRAVEL_LABELS = {
+    "Non-Travel": "No travel",
+    "Travel_Rarely": "Rare travel",
+    "Travel_Frequently": "Frequent travel",
+}
+
+business_travel_summary = (
+    analysis_df.groupby("BusinessTravel", observed=True)["AttritionBinary"]
+    .agg(employees="size", attrition_cases="sum", attrition_rate="mean")
+    .reindex(TRAVEL_ORDER)
+    .reset_index()
+)
+
+business_travel_intervals = business_travel_summary.apply(
+    lambda row: wilson_interval(
+        int(row["attrition_cases"]),
+        int(row["employees"]),
+    ),
+    axis=1,
+)
+business_travel_summary[["ci_95_low", "ci_95_high"]] = pd.DataFrame(
+    business_travel_intervals.tolist(),
+    index=business_travel_summary.index,
+)
+business_travel_summary["travel_label"] = business_travel_summary[
+    "BusinessTravel"
+].map(TRAVEL_LABELS)
+
+display(
+    business_travel_summary[
+        [
+            "BusinessTravel",
+            "employees",
+            "attrition_cases",
+            "attrition_rate",
+            "ci_95_low",
+            "ci_95_high",
+        ]
+    ]
+)
+```
+
+### 8.3 Attrition rates across job demands
+
+```{python}
+overtime_risk_plot = pd.DataFrame(
+    {
+        "condition": ["No overtime", "Overtime"],
+        "risk": [
+            overtime_effects.loc[1, "estimate"],
+            overtime_effects.loc[0, "estimate"],
+        ],
+        "ci_95_low": [
+            overtime_effects.loc[1, "ci_95_low"],
+            overtime_effects.loc[0, "ci_95_low"],
+        ],
+        "ci_95_high": [
+            overtime_effects.loc[1, "ci_95_high"],
+            overtime_effects.loc[0, "ci_95_high"],
+        ],
+    }
+)
+
+fig, axes = plt.subplots(1, 2, figsize=(12, 4.8), sharey=True)
+
+for ax, plot_data, x_column, title in [
+    (axes[0], overtime_risk_plot, "condition", "Overtime"),
+    (
+        axes[1],
+        business_travel_summary,
+        "travel_label",
+        "Business travel",
+    ),
+]:
+    risks = plot_data["risk"] if "risk" in plot_data else plot_data["attrition_rate"]
+    bars = ax.bar(
+        plot_data[x_column],
+        risks * 100,
+        color=[RETENTION_COLOR, ATTRITION_COLOR, "#F4A261"][: len(plot_data)],
+        width=0.68,
+    )
+    ax.errorbar(
+        x=np.arange(len(plot_data)),
+        y=risks * 100,
+        yerr=[
+            (risks - plot_data["ci_95_low"]) * 100,
+            (plot_data["ci_95_high"] - risks) * 100,
+        ],
+        fmt="none",
+        ecolor="#2D3748",
+        capsize=4,
+        linewidth=1.4,
+    )
+    for bar, risk in zip(bars, risks):
+        ax.text(
+            bar.get_x() + bar.get_width() / 2,
+            bar.get_height() + 1.5,
+            f"{risk:.1%}",
+            ha="center",
+            fontweight="bold",
+        )
+    ax.set_title(title)
+    ax.set_xlabel("")
+    ax.tick_params(axis="x", rotation=12)
+
+axes[0].set_ylabel("Observed attrition rate (%)")
+axes[0].set_ylim(0, 38)
+fig.suptitle("Observed attrition varies across job-demand conditions", fontsize=15)
+sns.despine(fig=fig)
+plt.tight_layout()
+plt.show()
+plt.close(fig)
+```
+
+### 8.4 Distance from home
+
+```{python}
+distance_summary = (
+    analysis_df.assign(
+        outcome_group=analysis_df[TARGET_COLUMN].map(
+            {"No": "Stayed", "Yes": "Left"}
+        )
+    )
+    .groupby("outcome_group", observed=True)["DistanceFromHome"]
+    .agg(
+        n="size",
+        mean="mean",
+        standard_deviation="std",
+        median="median",
+        q1=lambda values: values.quantile(0.25),
+        q3=lambda values: values.quantile(0.75),
+    )
+    .reindex(["Stayed", "Left"])
+    .reset_index()
+)
+
+distance_left = analysis_df.loc[
+    analysis_df[TARGET_COLUMN].eq("Yes"), "DistanceFromHome"
+]
+distance_stayed = analysis_df.loc[
+    analysis_df[TARGET_COLUMN].eq("No"), "DistanceFromHome"
+]
+distance_delta = cliffs_delta(distance_left, distance_stayed)
+distance_delta_ci = bootstrap_cliffs_delta(
+    distance_left,
+    distance_stayed,
+    random_seed=RANDOM_SEED + 100,
+)
+
+distance_effect = pd.DataFrame(
+    {
+        "measure": ["Cliff's delta: Left compared with Stayed"],
+        "estimate": [distance_delta],
+        "ci_95_low": [distance_delta_ci[0]],
+        "ci_95_high": [distance_delta_ci[1]],
+    }
+)
+
+display(distance_summary)
+display(distance_effect)
+```
+
+```{python}
+distance_plot_data = analysis_df.assign(
+    outcome_group=analysis_df[TARGET_COLUMN].map({"No": "Stayed", "Yes": "Left"})
+)
+
+fig, ax = plt.subplots(figsize=(8.5, 5))
+sns.ecdfplot(
+    data=distance_plot_data,
+    x="DistanceFromHome",
+    hue="outcome_group",
+    hue_order=["Stayed", "Left"],
+    palette={"Stayed": RETENTION_COLOR, "Left": ATTRITION_COLOR},
+    linewidth=2,
+    ax=ax,
+)
+ax.set(
+    title="Distance from home distributions overlap substantially",
+    xlabel="Distance from home",
+    ylabel="Cumulative proportion",
+)
+sns.despine(ax=ax)
+plt.tight_layout()
+plt.show()
+plt.close(fig)
+```
+
+## Phase 3 interpretation checkpoint
+
+Overtime has the clearest bivariate association in this phase. Attrition is observed
+for 30.5% of employees with overtime and 10.4% of employees without overtime. The
+risk difference is 20.1 percentage points, with a 95% bootstrap interval from 15.4 to
+24.9 percentage points.
+
+The estimated risk ratio is 2.93 (95% CI: 2.33 to 3.68): observed attrition is almost
+three times as frequent among employees with overtime. The odds ratio is larger at
+3.77 (95% CI: 2.83 to 5.03). Because attrition among employees with overtime is not
+rare, the odds ratio should not be described as if employees were 3.77 times as likely
+to leave; that interpretation belongs to the risk ratio.
+
+Business travel shows an ordered descriptive pattern even though the variable was not
+modeled as numeric:
+
+- no travel: 8.0% attrition, 95% Wilson CI [4.6%, 13.5%];
+- rare travel: 15.0%, 95% Wilson CI [12.9%, 17.2%];
+- frequent travel: 24.9%, 95% Wilson CI [20.2%, 30.3%].
+
+Employees who left also live farther from work on average: mean distance 10.63 and
+median 9, compared with mean 8.92 and median 7 among employees who stayed. Cliff's
+delta is 0.124 (95% bootstrap CI: 0.048 to 0.204), indicating a modest positive shift
+with substantial overlap between the distributions.
+
+These comparisons are descriptive and do not establish that overtime, travel, or
+distance cause attrition. Job role, level, compensation, or career stage may influence
+both exposure to these conditions and the probability of leaving. Their purpose is to
+quantify the observed associations before the variables enter multivariable models.
+
+## Next step
+
+The next phase examines career and organizational context. These variables are kept
+separate from attitude indicators and job demands so that their incremental predictive
+value can later be evaluated explicitly.
+
+## 9. Career and organizational context
+
+Career variables describe accumulated experience and attachment to the current
+organization. They are not independent constructs: an employee with many years at the
+company is also likely to have more years in the current role and with the current
+manager. We therefore examine both group differences and redundancy between variables.
+
+### 9.1 Reusable ordered-variable comparison
+
+The same comparison function is used for counts, durations, ordinal variables, and
+income. Cliff's delta provides a common unit-free effect size, while means and medians
+preserve the original scale for substantive interpretation.
+
+```{python}
+def summarize_ordered_group_effects(
+    data: pd.DataFrame,
+    variables: list[str],
+    variable_labels: dict[str, str],
+    seed_offset: int = 0,
+) -> pd.DataFrame:
+    """Compare ordered or numeric variables between attrition groups."""
+    result_rows = []
+
+    for variable_index, variable in enumerate(variables):
+        values_left = data.loc[data[TARGET_COLUMN].eq("Yes"), variable]
+        values_stayed = data.loc[data[TARGET_COLUMN].eq("No"), variable]
+
+        delta_estimate = cliffs_delta(values_left, values_stayed)
+        delta_ci_low, delta_ci_high = bootstrap_cliffs_delta(
+            values_left,
+            values_stayed,
+            random_seed=RANDOM_SEED + seed_offset + variable_index,
+        )
+
+        result_rows.append(
+            {
+                "variable": variable,
+                "label": variable_labels[variable],
+                "mean_left": values_left.mean(),
+                "mean_stayed": values_stayed.mean(),
+                "median_left": values_left.median(),
+                "median_stayed": values_stayed.median(),
+                "cliffs_delta": delta_estimate,
+                "ci_95_low": delta_ci_low,
+                "ci_95_high": delta_ci_high,
+            }
+        )
+
+    return (
+        pd.DataFrame(result_rows)
+        .sort_values("cliffs_delta")
+        .reset_index(drop=True)
+    )
+
+
+def plot_ordered_effects(
+    effect_table: pd.DataFrame,
+    title: str,
+    ax: plt.Axes | None = None,
+) -> plt.Axes:
+    """Create a forest plot for Cliff's delta estimates."""
+    plot_data = effect_table.sort_values("cliffs_delta")
+
+    if ax is None:
+        _, ax = plt.subplots(figsize=(9, 6))
+
+    ax.errorbar(
+        x=plot_data["cliffs_delta"],
+        y=plot_data["label"],
+        xerr=[
+            plot_data["cliffs_delta"] - plot_data["ci_95_low"],
+            plot_data["ci_95_high"] - plot_data["cliffs_delta"],
+        ],
+        fmt="o",
+        color=ATTRITION_COLOR,
+        ecolor="#4A5568",
+        elinewidth=1.5,
+        capsize=4,
+        markersize=7,
+    )
+    ax.axvline(0, color="black", linestyle="--", linewidth=1)
+    ax.set(
+        title=title,
+        xlabel="Cliff's delta: Left compared with Stayed",
+        ylabel="",
+    )
+    sns.despine(ax=ax)
+    return ax
+```
+
+### 9.2 Career and tenure indicators
+
+```{python}
+CAREER_VARIABLES = [
+    "NumCompaniesWorked",
+    "TotalWorkingYears",
+    "TrainingTimesLastYear",
+    "YearsAtCompany",
+    "YearsInCurrentRole",
+    "YearsSinceLastPromotion",
+    "YearsWithCurrManager",
+]
+
+CAREER_LABELS = {
+    "NumCompaniesWorked": "Number of companies worked",
+    "TotalWorkingYears": "Total working years",
+    "TrainingTimesLastYear": "Training times last year",
+    "YearsAtCompany": "Years at company",
+    "YearsInCurrentRole": "Years in current role",
+    "YearsSinceLastPromotion": "Years since last promotion",
+    "YearsWithCurrManager": "Years with current manager",
+}
+
+career_effects = summarize_ordered_group_effects(
+    data=analysis_df,
+    variables=CAREER_VARIABLES,
+    variable_labels=CAREER_LABELS,
+    seed_offset=200,
+)
+
+display(career_effects)
+```
+
+```{python}
+fig, ax = plt.subplots(figsize=(9.5, 6))
+plot_ordered_effects(
+    career_effects,
+    title="Employees who left generally have shorter organizational tenure",
+    ax=ax,
+)
+plt.tight_layout()
+plt.show()
+plt.close(fig)
+```
+
+### 9.3 Redundancy among career indicators
+
+Spearman correlation uses ranks rather than raw distances. It is suitable here because
+the variables are bounded counts or durations and their relationships may be monotonic
+without being linear. High correlations do not make a predictor invalid, but they
+affect coefficient stability and interpretation in regression models.
+
+```{python}
+career_spearman = analysis_df[CAREER_VARIABLES].corr(method="spearman")
+
+career_spearman_display = career_spearman.rename(
+    index=CAREER_LABELS,
+    columns=CAREER_LABELS,
+)
+
+fig, ax = plt.subplots(figsize=(10, 8))
+sns.heatmap(
+    career_spearman_display,
+    annot=True,
+    fmt=".2f",
+    cmap="vlag",
+    center=0,
+    vmin=-1,
+    vmax=1,
+    square=True,
+    linewidths=0.5,
+    cbar_kws={"label": "Spearman correlation"},
+    ax=ax,
+)
+ax.set_title("Career indicators contain overlapping information", pad=14)
+plt.tight_layout()
+plt.show()
+plt.close(fig)
+```
+
+### 9.4 Ordered organizational context
+
+The next block covers ordered or numeric organizational variables. Income is included
+on its original scale, but Cliff's delta depends only on ordering, so it remains
+comparable with the other effects. The effect does not mean that a one-unit change has
+the same substantive meaning across variables.
+
+```{python}
+ORDERED_CONTEXT_VARIABLES = [
+    "Education",
+    "JobLevel",
+    "MonthlyIncome",
+    "PercentSalaryHike",
+    "PerformanceRating",
+    "StockOptionLevel",
+]
+
+ORDERED_CONTEXT_LABELS = {
+    "Education": "Education level",
+    "JobLevel": "Job level",
+    "MonthlyIncome": "Monthly income",
+    "PercentSalaryHike": "Percent salary hike",
+    "PerformanceRating": "Performance rating",
+    "StockOptionLevel": "Stock-option level",
+}
+
+ordered_context_effects = summarize_ordered_group_effects(
+    data=analysis_df,
+    variables=ORDERED_CONTEXT_VARIABLES,
+    variable_labels=ORDERED_CONTEXT_LABELS,
+    seed_offset=400,
+)
+
+display(ordered_context_effects)
+```
+
+```{python}
+fig, ax = plt.subplots(figsize=(9.5, 5.5))
+plot_ordered_effects(
+    ordered_context_effects,
+    title="Ordered organizational context differs across attrition groups",
+    ax=ax,
+)
+plt.tight_layout()
+plt.show()
+plt.close(fig)
+```
+
+### 9.5 Categorical organizational context
+
+Department, job role, and education field are nominal categories. Their labels have
+no defensible numeric order, so the analysis estimates an attrition rate and Wilson
+interval separately for every category.
+
+```{python}
+def summarize_category_attrition(
+    data: pd.DataFrame,
+    variable: str,
+) -> pd.DataFrame:
+    """Estimate category-specific attrition rates and Wilson intervals."""
+    summary = (
+        data.groupby(variable, observed=True)["AttritionBinary"]
+        .agg(employees="size", attrition_cases="sum", attrition_rate="mean")
+        .reset_index()
+    )
+
+    intervals = summary.apply(
+        lambda row: wilson_interval(
+            int(row["attrition_cases"]),
+            int(row["employees"]),
+        ),
+        axis=1,
+    )
+    summary[["ci_95_low", "ci_95_high"]] = pd.DataFrame(
+        intervals.tolist(),
+        index=summary.index,
+    )
+
+    return summary.sort_values("attrition_rate", ascending=False).reset_index(drop=True)
+
+
+CATEGORICAL_CONTEXT_VARIABLES = ["Department", "JobRole", "EducationField"]
+categorical_context_summaries = {
+    variable: summarize_category_attrition(analysis_df, variable)
+    for variable in CATEGORICAL_CONTEXT_VARIABLES
+}
+
+for variable, summary in categorical_context_summaries.items():
+    print(f"\n{variable}")
+    display(summary)
+```
+
+### 9.6 Category-rate comparison
+
+The vertical dashed line is the overall attrition rate. A category above or below the
+line is not automatically unusual: its interval and sample size must also be examined.
+
+```{python}
+def plot_category_attrition(
+    summary: pd.DataFrame,
+    category_column: str,
+    title: str,
+    ax: plt.Axes,
+    sort_by_rate: bool = True,
+) -> None:
+    """Plot category-specific attrition rates with Wilson intervals."""
+    plot_data = (
+        summary.sort_values("attrition_rate")
+        if sort_by_rate
+        else summary.copy()
+    )
+    positions = np.arange(len(plot_data))
+
+    ax.errorbar(
+        x=plot_data["attrition_rate"] * 100,
+        y=positions,
+        xerr=[
+            (plot_data["attrition_rate"] - plot_data["ci_95_low"]) * 100,
+            (plot_data["ci_95_high"] - plot_data["attrition_rate"]) * 100,
+        ],
+        fmt="o",
+        color=RETENTION_COLOR,
+        ecolor="#4A5568",
+        capsize=3,
+        markersize=6,
+    )
+    ax.axvline(
+        attrition_proportion * 100,
+        color=ATTRITION_COLOR,
+        linestyle="--",
+        linewidth=1.3,
+        label="Overall rate",
+    )
+    ax.set_yticks(positions)
+    ax.set_yticklabels(plot_data[category_column])
+    ax.set_title(title)
+    ax.set_xlabel("Observed attrition rate (%)")
+    ax.set_ylabel("")
+    sns.despine(ax=ax)
+
+
+fig, axes = plt.subplots(1, 3, figsize=(18, 7))
+plot_category_attrition(
+    categorical_context_summaries["Department"],
+    category_column="Department",
+    title="Department",
+    ax=axes[0],
+)
+plot_category_attrition(
+    categorical_context_summaries["JobRole"],
+    category_column="JobRole",
+    title="Job role",
+    ax=axes[1],
+)
+plot_category_attrition(
+    categorical_context_summaries["EducationField"],
+    category_column="EducationField",
+    title="Education field",
+    ax=axes[2],
+)
+axes[0].legend(loc="lower right")
+fig.suptitle(
+    "Organizational categories vary in observed attrition",
+    fontsize=16,
+    y=1.02,
+)
+plt.tight_layout()
+plt.show()
+plt.close(fig)
+```
+
+## Phase 4 interpretation checkpoint
+
+Employees who left have consistently shorter careers and organizational tenure. The
+largest ordinal separations are observed for total working years
+($\delta=-0.312$, 95% CI $[-0.393, -0.229]$), years at the company
+($\delta=-0.298$, 95% CI $[-0.376, -0.215]$), years in the current role
+($\delta=-0.280$, 95% CI $[-0.356, -0.206]$), and years with the current manager
+($\delta=-0.272$, 95% CI $[-0.351, -0.194]$). These variables contain stronger
+bivariate separation than the individual attitude indicators.
+
+The tenure measures are not independent. Spearman correlations are 0.85 between years
+at the company and years in the current role, 0.84 between years at the company and
+years with the current manager, and 0.73 between years in the current role and years
+with the current manager. An unregularized regression containing all of them could
+produce unstable coefficients even if its predictions remain useful. Later modeling
+will therefore use pipelines and regularization, and individual coefficients will not
+be interpreted as isolated effects.
+
+Within ordered organizational context, the strongest differences are monthly income
+($\delta=-0.311$, 95% CI $[-0.388, -0.235]$), job level
+($\delta=-0.283$, 95% CI $[-0.354, -0.210]$), and stock-option level
+($\delta=-0.250$, 95% CI $[-0.322, -0.177]$). Employees who left have a median monthly
+income of 3,202 compared with 5,204 among employees who stayed. Education, percent
+salary hike, and performance rating show little bivariate separation in this dataset.
+
+Nominal categories also vary substantially. Sales Representatives have the highest
+observed attrition rate at 39.8% (95% CI: 29.9% to 50.5%), followed by Laboratory
+Technicians at 23.9%. Research Directors have the lowest observed rate at 2.5%, but
+only two attrition cases occur in that category. At the department level, Sales has
+20.6% observed attrition compared with 13.8% in Research and Development.
+
+Category estimates with small samples remain uncertain. For example, the Human
+Resources education field has a 25.9% observed rate but only 27 employees, producing
+a wide 95% interval from 13.2% to 44.7%. These estimates are descriptive and involve
+multiple comparisons; isolated high rates should not be converted directly into
+intervention priorities.
+
+The results also suggest structural entanglement: income, level, tenure, and role are
+likely to describe overlapping career position. Multivariable models are needed to
+test which blocks add predictive information, but they will not turn these
+observational associations into causal effects.
+
+## Next step
+
+The descriptive phase closes with a sensitive-attribute audit and a prespecified model
+matrix. Only then will the train/test split and predictive modeling begin.
+
+## 10. Sensitive-attribute audit
+
+Age, gender, and marital status are personal attributes with potential ethical and
+fairness implications. They are excluded from the primary predictive models but
+retained in a separate audit table for two purposes:
+
+1. describe outcome differences already present in the synthetic dataset;
+2. later evaluate whether model errors and calibration differ across groups.
+
+Excluding these variables does not guarantee fairness. Job role, income, tenure, or
+education field may retain correlated information and function as proxies. A genuine
+fairness assessment must therefore evaluate model outcomes, not only inspect the list
+of included columns.
+
+### 10.1 Age
+
+Age is analyzed continuously with Cliff's delta. Predefined bands are added only to
+communicate observed rates; the cut points were specified before viewing their
+attrition rates and will not be used as model predictors.
+
+```{python}
+AGE_BINS = [18, 25, 35, 45, 55, np.inf]
+AGE_BAND_LABELS = ["18-24", "25-34", "35-44", "45-54", "55+"]
+
+sensitive_audit_df = analysis_df.assign(
+    AgeBand=pd.cut(
+        analysis_df["Age"],
+        bins=AGE_BINS,
+        labels=AGE_BAND_LABELS,
+        right=False,
+        include_lowest=True,
+    )
+)
+
+if sensitive_audit_df["AgeBand"].isna().any():
+    raise ValueError("At least one employee was not assigned to an age band.")
+
+age_effect = summarize_ordered_group_effects(
+    data=analysis_df,
+    variables=["Age"],
+    variable_labels={"Age": "Age"},
+    seed_offset=600,
+)
+
+age_band_summary = summarize_category_attrition(
+    sensitive_audit_df,
+    "AgeBand",
+)
+age_band_summary = (
+    age_band_summary.set_index("AgeBand")
+    .reindex(AGE_BAND_LABELS)
+    .reset_index()
+)
+
+display(age_effect)
+display(age_band_summary)
+```
+
+### 10.2 Gender and marital status
+
+```{python}
+gender_summary = summarize_category_attrition(
+    sensitive_audit_df,
+    "Gender",
+)
+marital_status_summary = summarize_category_attrition(
+    sensitive_audit_df,
+    "MaritalStatus",
+)
+
+display(gender_summary)
+display(marital_status_summary)
+```
+
+### 10.3 Sensitive-attribute rates
+
+```{python}
+fig, axes = plt.subplots(1, 3, figsize=(17, 5.5))
+plot_category_attrition(
+    age_band_summary,
+    category_column="AgeBand",
+    title="Age band",
+    ax=axes[0],
+    sort_by_rate=False,
+)
+plot_category_attrition(
+    gender_summary,
+    category_column="Gender",
+    title="Gender",
+    ax=axes[1],
+)
+plot_category_attrition(
+    marital_status_summary,
+    category_column="MaritalStatus",
+    title="Marital status",
+    ax=axes[2],
+)
+axes[0].legend(loc="upper right")
+fig.suptitle(
+    "Sensitive attributes are audited but excluded from primary prediction",
+    fontsize=15,
+    y=1.02,
+)
+plt.tight_layout()
+plt.show()
+plt.close(fig)
+```
+
+## 11. Prespecified predictor sets
+
+The predictive comparison is defined before the train/test split. This prevents the
+test data from influencing which predictors are retained and makes the incremental-
+validity question explicit.
+
+### 11.1 Behavioral model
+
+The behavioral model contains the five attitude indicators and the three observable
+job-demand variables. It asks how much predictive information is available from
+employee experience and demand indicators without organizational position or career
+history.
+
+### 11.2 Contextual model
+
+The contextual model contains career history, organizational position, compensation,
+and educational background. It excludes attitude indicators, job demands, sensitive
+attributes, identifiers, constants, and ambiguous rate variables.
+
+### 11.3 Combined model
+
+The combined model is the union of behavioral and contextual predictors. Comparing it
+with the contextual model tests whether behavioral information adds out-of-sample
+predictive value beyond structural context.
+
+```{python}
+BEHAVIORAL_PREDICTORS = [
+    *ATTITUDE_INDICATORS,
+    "BusinessTravel",
+    "DistanceFromHome",
+    "OverTime",
+]
+
+CONTEXTUAL_PREDICTORS = [
+    *CAREER_VARIABLES,
+    "Department",
+    "Education",
+    "EducationField",
+    "JobLevel",
+    "JobRole",
+    "MonthlyIncome",
+    "PercentSalaryHike",
+    "PerformanceRating",
+    "StockOptionLevel",
+]
+
+COMBINED_PREDICTORS = [
+    *BEHAVIORAL_PREDICTORS,
+    *CONTEXTUAL_PREDICTORS,
+]
+
+SENSITIVE_AUDIT_VARIABLES = ["Age", "Gender", "MaritalStatus"]
+
+NOMINAL_PREDICTORS = {
+    "BusinessTravel",
+    "Department",
+    "EducationField",
+    "JobRole",
+    "OverTime",
+}
+
+MODEL_PREDICTOR_SETS = {
+    "Behavioral": BEHAVIORAL_PREDICTORS,
+    "Contextual": CONTEXTUAL_PREDICTORS,
+    "Combined": COMBINED_PREDICTORS,
+}
+```
+
+### 11.4 Validate the specification
+
+These checks prevent accidental feature leakage, duplicated predictors, or inclusion
+of sensitive and excluded variables.
+
+```{python}
+excluded_source_columns = set(excluded_columns)
+
+for model_name, predictors in MODEL_PREDICTOR_SETS.items():
+    if len(predictors) != len(set(predictors)):
+        raise ValueError(f"Duplicated predictors in the {model_name} model.")
+
+    missing_predictors = sorted(set(predictors) - set(analysis_df.columns))
+    if missing_predictors:
+        raise ValueError(
+            f"Missing predictors in the {model_name} model: {missing_predictors}"
+        )
+
+    prohibited_predictors = sorted(
+        set(predictors)
+        & (
+            set(SENSITIVE_AUDIT_VARIABLES)
+            | excluded_source_columns
+            | {TARGET_COLUMN, "AttritionBinary"}
+        )
+    )
+    if prohibited_predictors:
+        raise ValueError(
+            f"Prohibited predictors in the {model_name} model: "
+            f"{prohibited_predictors}"
+        )
+
+if set(BEHAVIORAL_PREDICTORS) & set(CONTEXTUAL_PREDICTORS):
+    raise ValueError("Behavioral and contextual predictor sets must not overlap.")
+
+if set(COMBINED_PREDICTORS) != (
+    set(BEHAVIORAL_PREDICTORS) | set(CONTEXTUAL_PREDICTORS)
+):
+    raise ValueError("The combined model must be the exact union of both blocks.")
+
+print("All model specifications passed leakage and consistency checks.")
+```
+
+### 11.5 Modeling matrix
+
+Nominal variables will be one-hot encoded inside each modeling pipeline. Numeric and
+ordered variables will remain numeric; they will be standardized for regularized
+logistic regression, while tree models can split them nonlinearly without scaling.
+
+```{python}
+model_specification_rows = []
+
+for model_name, predictors in MODEL_PREDICTOR_SETS.items():
+    for predictor in predictors:
+        model_specification_rows.append(
+            {
+                "model": model_name,
+                "predictor": predictor,
+                "block": (
+                    "Behavioral"
+                    if predictor in BEHAVIORAL_PREDICTORS
+                    else "Contextual"
+                ),
+                "encoding": (
+                    "One-hot nominal"
+                    if predictor in NOMINAL_PREDICTORS
+                    else "Numeric or ordered"
+                ),
+            }
+        )
+
+model_specification = pd.DataFrame(model_specification_rows)
+
+model_specification_summary = (
+    model_specification.groupby(["model", "block", "encoding"], as_index=False)
+    .agg(n_predictors=("predictor", "count"))
+    .sort_values(["model", "block", "encoding"])
+)
+
+display(model_specification_summary)
+display(model_specification)
+```
+
+## Phase 5 interpretation checkpoint
+
+Employees who left are younger on average: mean age 33.61 and median 32, compared with
+mean 37.56 and median 36 among employees who stayed. Cliff's delta is -0.269
+(95% bootstrap CI: -0.343 to -0.189), indicating a consistent shift toward younger
+ages among employees who left.
+
+The predefined age bands show 39.2% observed attrition among employees aged 18-24 and
+20.2% among those aged 25-34. Rates are approximately 10% in the 35-44 and 45-54
+bands. The 55+ estimate rises to 15.9%, but the group contains only 69 employees and
+its interval is wide (9.1% to 26.3%). The pattern should therefore not be reduced to a
+single monotonic age trend.
+
+Observed attrition is 17.0% among men and 14.8% among women. The Wilson intervals
+overlap substantially, so the descriptive difference is small relative to its
+uncertainty. Marital status shows a larger pattern: 25.5% among single employees,
+12.5% among married employees, and 10.1% among divorced employees. Marital status may
+also act as a proxy for age, career stage, or other unobserved circumstances and is not
+treated as an intervention target.
+
+This audit documents pre-existing outcome differences but does not yet measure model
+fairness because no predictions exist. Later fairness checks will compare model error
+rates and calibration across groups where sample size is sufficient. Small groups and
+low attrition counts will be reported rather than interpreted with unstable metrics.
+
+The model specification is now frozen for the primary comparison:
+
+- **Behavioral:** 8 predictors: 6 numeric or ordered and 2 nominal;
+- **Contextual:** 16 predictors: 13 numeric or ordered and 3 nominal;
+- **Combined:** the exact 24-predictor union of both blocks.
+
+All specification checks confirm that identifiers, constants, ambiguous rate
+variables, sensitive attributes, and outcome columns are absent from the predictor
+sets. Comparing the combined model against the contextual model will estimate the
+incremental out-of-sample value of the behavioral block.
+
+## Next step
+
+The next phase creates one stratified holdout test set and a cross-validation scheme
+within the remaining development data. Preprocessing will be fitted only on training
+folds to prevent leakage.
+
+## 12. Experimental design: holdout and cross-validation
+
+The predictive workflow separates two different purposes:
+
+- **Development data:** model comparison, preprocessing decisions, hyperparameter
+  selection, and any threshold exploration.
+- **Holdout test data:** one final estimate of generalization after the workflow has
+  been frozen.
+
+Repeatedly checking the test set would turn it into another development set and make
+its performance estimate optimistic.
+
+### 12.1 Create a stable stratified holdout
+
+The split is based on employee identifiers sorted before randomization. The identifier
+controls row membership but is never passed to a predictive model. Stratification
+approximately preserves the 16.1% attrition prevalence in both partitions.
+
+```{python}
+from sklearn.model_selection import RepeatedStratifiedKFold, train_test_split
+
+TEST_SIZE = 0.20
+CV_SPLITS = 5
+CV_REPEATS = 5
+
+split_source = (
+    pd.DataFrame(
+        {
+            "EmployeeNumber": raw_df["EmployeeNumber"],
+            "AttritionBinary": analysis_df["AttritionBinary"],
+        }
+    )
+    .sort_values("EmployeeNumber")
+    .reset_index(drop=True)
+)
+
+development_ids, test_ids = train_test_split(
+    split_source["EmployeeNumber"],
+    test_size=TEST_SIZE,
+    random_state=RANDOM_SEED,
+    stratify=split_source["AttritionBinary"],
+)
+
+development_id_set = set(development_ids)
+test_id_set = set(test_ids)
+
+development_mask = raw_df["EmployeeNumber"].isin(development_id_set)
+test_mask = raw_df["EmployeeNumber"].isin(test_id_set)
+
+development_df = analysis_df.loc[development_mask].copy()
+test_df = analysis_df.loc[test_mask].copy()
+
+development_employee_ids = raw_df.loc[
+    development_mask, "EmployeeNumber"
+].copy()
+test_employee_ids = raw_df.loc[test_mask, "EmployeeNumber"].copy()
+
+split_assignment = pd.DataFrame(
+    {
+        "EmployeeNumber": raw_df["EmployeeNumber"],
+        "partition": np.where(development_mask, "Development", "Test"),
+    }
+).sort_values("EmployeeNumber")
+```
+
+### 12.2 Validate the partition
+
+```{python}
+if development_id_set & test_id_set:
+    raise ValueError("Employee overlap detected between development and test sets.")
+
+if development_id_set | test_id_set != set(raw_df["EmployeeNumber"]):
+    raise ValueError("The split does not cover every employee exactly once.")
+
+if len(development_df) + len(test_df) != len(analysis_df):
+    raise ValueError("Development and test row counts do not reconstruct the source.")
+
+for partition_name, partition_df in {
+    "Development": development_df,
+    "Test": test_df,
+}.items():
+    observed_classes = set(partition_df["AttritionBinary"].unique())
+    if observed_classes != {0, 1}:
+        raise ValueError(
+            f"{partition_name} does not contain both outcome classes: "
+            f"{observed_classes}"
+        )
+
+split_summary = pd.DataFrame(
+    [
+        {
+            "partition": partition_name,
+            "employees": len(partition_df),
+            "attrition_cases": int(partition_df["AttritionBinary"].sum()),
+            "attrition_rate": partition_df["AttritionBinary"].mean(),
+        }
+        for partition_name, partition_df in {
+            "Full source": analysis_df,
+            "Development": development_df,
+            "Test": test_df,
+        }.items()
+    ]
+)
+
+display(split_summary)
+print("No employee overlap; every source row belongs to exactly one partition.")
+```
+
+Only test-set size and outcome balance are inspected here. Predictor distributions,
+associations, and model performance in the test set remain unexamined until final
+evaluation.
+
+### 12.3 Define repeated stratified cross-validation
+
+Five-fold cross-validation divides the development set into five parts. Each model is
+fitted on four parts and evaluated on the fifth, rotating until every observation has
+served as validation data. Repeating the process five times with different fold
+assignments reduces dependence on a single partition.
+
+```{python}
+development_y = development_df["AttritionBinary"]
+
+repeated_cv = RepeatedStratifiedKFold(
+    n_splits=CV_SPLITS,
+    n_repeats=CV_REPEATS,
+    random_state=RANDOM_SEED,
+)
+
+cv_audit_rows = []
+placeholder_features = np.zeros((len(development_y), 1))
+
+for split_number, (train_positions, validation_positions) in enumerate(
+    repeated_cv.split(placeholder_features, development_y)
+):
+    repeat_number = split_number // CV_SPLITS + 1
+    fold_number = split_number % CV_SPLITS + 1
+    train_outcomes = development_y.iloc[train_positions]
+    validation_outcomes = development_y.iloc[validation_positions]
+
+    cv_audit_rows.append(
+        {
+            "repeat": repeat_number,
+            "fold": fold_number,
+            "train_employees": len(train_positions),
+            "train_attrition_cases": int(train_outcomes.sum()),
+            "train_attrition_rate": train_outcomes.mean(),
+            "validation_employees": len(validation_positions),
+            "validation_attrition_cases": int(validation_outcomes.sum()),
+            "validation_attrition_rate": validation_outcomes.mean(),
+        }
+    )
+
+cv_audit = pd.DataFrame(cv_audit_rows)
+
+if len(cv_audit) != CV_SPLITS * CV_REPEATS:
+    raise ValueError("Unexpected number of cross-validation folds.")
+
+if cv_audit["validation_attrition_cases"].min() == 0:
+    raise ValueError("At least one validation fold contains no attrition cases.")
+
+display(cv_audit.head(10))
+```
+
+### 12.4 Cross-validation audit
+
+```{python}
+cv_audit_summary = pd.DataFrame(
+    {
+        "metric": [
+            "Total validation evaluations",
+            "Minimum validation employees",
+            "Maximum validation employees",
+            "Minimum validation attrition cases",
+            "Maximum validation attrition cases",
+            "Minimum validation attrition rate",
+            "Maximum validation attrition rate",
+        ],
+        "value": [
+            len(cv_audit),
+            cv_audit["validation_employees"].min(),
+            cv_audit["validation_employees"].max(),
+            cv_audit["validation_attrition_cases"].min(),
+            cv_audit["validation_attrition_cases"].max(),
+            f"{cv_audit['validation_attrition_rate'].min():.1%}",
+            f"{cv_audit['validation_attrition_rate'].max():.1%}",
+        ],
+    }
+)
+
+display(cv_audit_summary)
+```
+
+### 12.5 Prespecified evaluation protocol
+
+The primary model-selection metric is **Average Precision**, which summarizes the
+precision-recall curve and is sensitive to performance on the minority attrition
+class. ROC-AUC remains a secondary ranking metric. Brier score and log loss evaluate
+probability quality and calibration.
+
+Accuracy is reported only as a familiar descriptive metric and is never used for model
+selection. Threshold-dependent metrics will be explored using development predictions;
+no operational threshold will be claimed without an explicit cost or intervention
+context.
+
+```{python}
+evaluation_protocol = pd.DataFrame(
+    {
+        "decision": [
+            "Holdout proportion",
+            "Holdout access",
+            "Development resampling",
+            "Primary selection metric",
+            "Secondary discrimination metric",
+            "Probability-quality metrics",
+            "Threshold-dependent metrics",
+            "Preprocessing scope",
+        ],
+        "specification": [
+            "20%, stratified by AttritionBinary",
+            "One final evaluation after model decisions are frozen",
+            "5-fold stratified cross-validation repeated 5 times",
+            "Average Precision",
+            "ROC-AUC",
+            "Brier score and log loss",
+            "Precision, recall, F1, specificity, and confusion matrix",
+            "Fit separately inside every training fold",
+        ],
+    }
+)
+
+display(evaluation_protocol)
+```
+
+## Phase 6 interpretation checkpoint
+
+The source sample contained 1,470 employees, including 237 observed attrition cases
+(16.1%). The reproducible stratified partition assigned 1,176 employees to the
+development set, including 190 attrition cases (16.2%), and 294 employees to the
+held-out test set, including 47 attrition cases (16.0%). The validation checks confirm
+that the two partitions do not overlap and together cover the complete source sample.
+
+Within the development set, five-times repeated five-fold stratified cross-validation
+produces 25 validation evaluations. Each validation fold contains 235 or 236 employees
+and exactly 38 attrition cases, with fold-specific attrition prevalence between 16.1%
+and 16.2%. Consequently, every development observation serves as validation data once
+per repeat and five times across the complete resampling procedure.
+
+The held-out test set is now sealed: its predictor distributions and model performance
+will not be inspected during preprocessing, feature construction, model selection, or
+hyperparameter tuning. Those decisions will use only `development_df` and the folds
+defined by `repeated_cv`. Cross-validation will support model comparison and selection;
+the test set will be used once, at the end, to estimate final generalization performance.
+
+## 13. Leakage-safe preprocessing and linear baselines
+
+This phase establishes interpretable reference models before introducing a more
+flexible algorithm. A **prevalence baseline** assigns the attrition prevalence learned
+from each training fold to every corresponding validation observation. A useful model
+should improve meaningfully on this no-information reference.
+
+The three substantive baselines are logistic regressions with L2 regularization:
+
+- **Behavioral:** attitudes and observable job demands;
+- **Contextual:** career and organizational context;
+- **Combined:** the union of both predictor blocks.
+
+Logistic regression models the log-odds of attrition as an additive function of the
+predictors. L2 regularization shrinks coefficients toward zero, helping stabilize the
+model when predictors are correlated. At this stage, the regularization strength is
+fixed at `C = 1`; tuning it comes later and must remain inside the development data.
+
+### 13.1 Define preprocessing pipelines
+
+Numeric and ordered predictors are median-imputed and standardized. Standardization
+puts them on comparable scales before the L2 penalty is applied. Nominal predictors
+are mode-imputed and one-hot encoded, with the first observed level used as the
+reference category. Unknown categories are safely ignored so that a category appearing
+in validation but not in its training fold does not cause an error.
+
+Although this dataset currently has no missing values, the imputers make the complete
+prediction procedure explicit and robust. Most importantly, the preprocessor lives
+inside the pipeline: its medians, modes, means, standard deviations, and category
+levels are estimated separately from each training fold.
+
+```{python}
+from sklearn.compose import ColumnTransformer
+from sklearn.dummy import DummyClassifier
+from sklearn.impute import SimpleImputer
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import cross_validate
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+
+
+def build_logistic_pipeline(predictors):
+    """Build an L2-logistic pipeline whose preprocessing is fold-specific."""
+    nominal_predictors = [
+        predictor for predictor in predictors if predictor in NOMINAL_PREDICTORS
+    ]
+    numeric_predictors = [
+        predictor for predictor in predictors if predictor not in NOMINAL_PREDICTORS
+    ]
+
+    numeric_pipeline = Pipeline(
+        steps=[
+            ("imputer", SimpleImputer(strategy="median")),
+            ("scaler", StandardScaler()),
+        ]
+    )
+    nominal_pipeline = Pipeline(
+        steps=[
+            ("imputer", SimpleImputer(strategy="most_frequent")),
+            (
+                "one_hot",
+                OneHotEncoder(
+                    drop="first",
+                    handle_unknown="ignore",
+                    sparse_output=True,
+                ),
+            ),
+        ]
+    )
+
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ("numeric", numeric_pipeline, numeric_predictors),
+            ("nominal", nominal_pipeline, nominal_predictors),
+        ],
+        remainder="drop",
+        verbose_feature_names_out=False,
+    )
+
+    return Pipeline(
+        steps=[
+            ("preprocessor", preprocessor),
+            (
+                "classifier",
+                LogisticRegression(
+                    C=1.0,
+                    solver="lbfgs",
+                    max_iter=2_000,
+                    class_weight=None,
+                    random_state=RANDOM_SEED,
+                ),
+            ),
+        ]
+    )
+```
+
+`class_weight=None` is deliberate. Artificially reweighting the outcome can change the
+meaning and calibration of predicted probabilities. We will first assess the natural
+probability model and later discuss threshold choice separately from model fitting.
+
+### 13.2 Inspect the pipeline specification
+
+This audit verifies which operation will be applied to every source predictor. It does
+not fit anything and therefore does not use the test set.
+
+```{python}
+preprocessing_audit_rows = []
+
+for model_name, predictors in MODEL_PREDICTOR_SETS.items():
+    for predictor in predictors:
+        preprocessing_audit_rows.append(
+            {
+                "model": model_name,
+                "predictor": predictor,
+                "source_type": (
+                    "Nominal" if predictor in NOMINAL_PREDICTORS
+                    else "Numeric or ordered"
+                ),
+                "fold_specific_operation": (
+                    "Mode imputation + one-hot encoding"
+                    if predictor in NOMINAL_PREDICTORS
+                    else "Median imputation + standardization"
+                ),
+            }
+        )
+
+preprocessing_audit = pd.DataFrame(preprocessing_audit_rows)
+
+if set(preprocessing_audit["predictor"]) != set(COMBINED_PREDICTORS):
+    raise ValueError("The preprocessing audit does not cover every predictor.")
+
+display(
+    preprocessing_audit.groupby(
+        ["model", "source_type", "fold_specific_operation"],
+        as_index=False,
+    ).agg(n_source_predictors=("predictor", "count"))
+)
+```
+
+### 13.3 Evaluate the prevalence and logistic baselines
+
+The same 25 train-validation partitions are used for every model. This paired design
+makes comparisons fair: differences cannot be attributed to different folds. Average
+Precision is the primary metric. ROC-AUC measures ranking discrimination, while Brier
+score and log loss evaluate the quality of the predicted probabilities; lower values
+are better for the latter two metrics.
+
+```{python}
+CV_SCORING = {
+    "average_precision": "average_precision",
+    "roc_auc": "roc_auc",
+    "brier_score": "neg_brier_score",
+    "log_loss": "neg_log_loss",
+}
+
+
+def collect_cv_results(model_name, evaluation):
+    """Convert one cross-validation result into a tidy fold-level table."""
+    rows = []
+    for split_number in range(CV_SPLITS * CV_REPEATS):
+        rows.append(
+            {
+                "model": model_name,
+                "repeat": split_number // CV_SPLITS + 1,
+                "fold": split_number % CV_SPLITS + 1,
+                "average_precision": evaluation["test_average_precision"][split_number],
+                "roc_auc": evaluation["test_roc_auc"][split_number],
+                "brier_score": -evaluation["test_brier_score"][split_number],
+                "log_loss": -evaluation["test_log_loss"][split_number],
+            }
+        )
+    return rows
+
+
+cv_model_rows = []
+dummy_features = np.zeros((len(development_y), 1))
+
+dummy_evaluation = cross_validate(
+    estimator=DummyClassifier(strategy="prior"),
+    X=dummy_features,
+    y=development_y,
+    cv=repeated_cv,
+    scoring=CV_SCORING,
+    n_jobs=1,
+    error_score="raise",
+)
+cv_model_rows.extend(
+    collect_cv_results("Prevalence baseline", dummy_evaluation)
+)
+
+for model_name, predictors in MODEL_PREDICTOR_SETS.items():
+    logistic_pipeline = build_logistic_pipeline(predictors)
+    model_evaluation = cross_validate(
+        estimator=logistic_pipeline,
+        X=development_df[predictors],
+        y=development_y,
+        cv=repeated_cv,
+        scoring=CV_SCORING,
+        n_jobs=1,
+        error_score="raise",
+    )
+    cv_model_rows.extend(
+        collect_cv_results(f"{model_name} logistic", model_evaluation)
+    )
+
+cv_model_results = pd.DataFrame(cv_model_rows)
+
+expected_rows = (1 + len(MODEL_PREDICTOR_SETS)) * CV_SPLITS * CV_REPEATS
+if len(cv_model_results) != expected_rows:
+    raise ValueError(
+        f"Expected {expected_rows} model-fold results; found {len(cv_model_results)}."
+    )
+
+if not np.isfinite(
+    cv_model_results[
+        ["average_precision", "roc_auc", "brier_score", "log_loss"]
+    ].to_numpy()
+).all():
+    raise ValueError("At least one cross-validation metric is not finite.")
+
+display(cv_model_results.head(10))
+```
+
+### 13.4 Summarize resampling performance
+
+The table reports the mean and standard deviation across the 25 validation evaluations.
+The standard deviation describes sensitivity to the resampled partitions; it is not a
+confidence interval because folds overlap across repetitions.
+
+```{python}
+model_order = [
+    "Prevalence baseline",
+    "Behavioral logistic",
+    "Contextual logistic",
+    "Combined logistic",
+]
+
+cv_model_summary = (
+    cv_model_results.groupby("model", as_index=False)
+    .agg(
+        average_precision_mean=("average_precision", "mean"),
+        average_precision_sd=("average_precision", "std"),
+        roc_auc_mean=("roc_auc", "mean"),
+        roc_auc_sd=("roc_auc", "std"),
+        brier_score_mean=("brier_score", "mean"),
+        brier_score_sd=("brier_score", "std"),
+        log_loss_mean=("log_loss", "mean"),
+        log_loss_sd=("log_loss", "std"),
+    )
+    .assign(
+        model=lambda data: pd.Categorical(
+            data["model"], categories=model_order, ordered=True
+        )
+    )
+    .sort_values("model")
+    .reset_index(drop=True)
+)
+
+display(cv_model_summary)
+```
+
+### 13.5 Visualize the primary metric
+
+The points show mean validation Average Precision; error bars show one standard
+deviation across folds. The dashed line marks the no-information prevalence baseline.
+
+```{python}
+plot_summary = cv_model_summary.copy()
+baseline_ap = plot_summary.loc[
+    plot_summary["model"] == "Prevalence baseline",
+    "average_precision_mean",
+].iloc[0]
+
+fig, ax = plt.subplots(figsize=(9, 5))
+y_positions = np.arange(len(plot_summary))
+
+ax.errorbar(
+    plot_summary["average_precision_mean"],
+    y_positions,
+    xerr=plot_summary["average_precision_sd"],
+    fmt="o",
+    color=RETENTION_COLOR,
+    ecolor="#566573",
+    capsize=4,
+    markersize=8,
+)
+ax.axvline(
+    baseline_ap,
+    color=ATTRITION_COLOR,
+    linestyle="--",
+    linewidth=1.5,
+    label=f"Prevalence baseline ({baseline_ap:.3f})",
+)
+ax.set_yticks(y_positions, plot_summary["model"].astype(str))
+ax.invert_yaxis()
+ax.set_xlabel("Validation Average Precision")
+ax.set_ylabel("")
+ax.set_title("Regularized logistic baselines compared across identical folds")
+ax.legend(loc="upper right")
+plt.tight_layout()
+plt.show()
+plt.close(fig)
+```
+
+## Phase 7 interpretation checkpoint
+
+After execution, we will answer three questions before adding complexity:
+
+1. Do all logistic models outperform the prevalence baseline?
+2. How much predictive information is present in the behavioral block alone?
+3. Does the combined specification improve consistently over the contextual model, or
+   do the two blocks contain largely overlapping information?
+
+We will consider all four metrics together. A model with slightly better discrimination
+but materially worse Brier score or log loss may rank employees better while producing
+less trustworthy probabilities. No test-set result is produced in this phase.
+
+## 14. Paired incremental-value analysis
+
+The preceding means suggest that the combined model is strongest, but means alone do
+not show whether its advantage is stable. Because all models used identical resampling
+partitions, we can subtract their scores within the same repeat and fold. This removes
+fold difficulty from the comparison: a positive paired advantage means that the first
+model performed better on that exact validation sample.
+
+For Average Precision and ROC-AUC, higher values are better, so the advantage is
+`first - second`. For Brier score and log loss, lower values are better, so the
+direction is reversed to `second - first`. Consequently, positive values always favor
+the first model named in the comparison.
+
+### 14.1 Calculate fold-specific advantages
+
+```{python}
+PAIRED_MODEL_COMPARISONS = [
+    ("Combined logistic", "Behavioral logistic"),
+    ("Combined logistic", "Contextual logistic"),
+    ("Behavioral logistic", "Contextual logistic"),
+]
+
+METRIC_DIRECTIONS = {
+    "average_precision": "higher",
+    "roc_auc": "higher",
+    "brier_score": "lower",
+    "log_loss": "lower",
+}
+
+paired_difference_rows = []
+
+for first_model, second_model in PAIRED_MODEL_COMPARISONS:
+    comparison_label = first_model.replace(" logistic", "") + " vs " + (
+        second_model.replace(" logistic", "")
+    )
+
+    first_results = cv_model_results.loc[
+        cv_model_results["model"] == first_model,
+        ["repeat", "fold", *METRIC_DIRECTIONS],
+    ]
+    second_results = cv_model_results.loc[
+        cv_model_results["model"] == second_model,
+        ["repeat", "fold", *METRIC_DIRECTIONS],
+    ]
+    paired_results = first_results.merge(
+        second_results,
+        on=["repeat", "fold"],
+        suffixes=("_first", "_second"),
+        validate="one_to_one",
+    )
+
+    if len(paired_results) != CV_SPLITS * CV_REPEATS:
+        raise ValueError(
+            f"Incomplete fold pairing for {first_model} and {second_model}."
+        )
+
+    for metric, preferred_direction in METRIC_DIRECTIONS.items():
+        raw_difference = (
+            paired_results[f"{metric}_first"]
+            - paired_results[f"{metric}_second"]
+        )
+        advantage = (
+            raw_difference if preferred_direction == "higher"
+            else -raw_difference
+        )
+
+        for row_position, row in paired_results.iterrows():
+            paired_difference_rows.append(
+                {
+                    "comparison": comparison_label,
+                    "first_model": first_model,
+                    "second_model": second_model,
+                    "repeat": int(row["repeat"]),
+                    "fold": int(row["fold"]),
+                    "metric": metric,
+                    "advantage_first_over_second": advantage.loc[row_position],
+                }
+            )
+
+paired_differences = pd.DataFrame(paired_difference_rows)
+
+expected_paired_rows = (
+    len(PAIRED_MODEL_COMPARISONS)
+    * len(METRIC_DIRECTIONS)
+    * CV_SPLITS
+    * CV_REPEATS
+)
+if len(paired_differences) != expected_paired_rows:
+    raise ValueError(
+        f"Expected {expected_paired_rows} paired results; "
+        f"found {len(paired_differences)}."
+    )
+
+display(paired_differences.head(10))
+```
+
+### 14.2 Summarize consistency across folds
+
+The `favorable_fold_percentage` is the proportion of the 25 paired evaluations in
+which the first model performs better. It is a descriptive stability measure, not a
+p-value. Similarly, the fold standard deviation is not a standard error because folds
+overlap across repetitions.
+
+```{python}
+comparison_order = [
+    "Combined vs Behavioral",
+    "Combined vs Contextual",
+    "Behavioral vs Contextual",
+]
+metric_order = ["average_precision", "roc_auc", "brier_score", "log_loss"]
+
+paired_difference_summary = (
+    paired_differences.groupby(["comparison", "metric"], as_index=False)
+    .agg(
+        mean_advantage=("advantage_first_over_second", "mean"),
+        median_advantage=("advantage_first_over_second", "median"),
+        advantage_sd=("advantage_first_over_second", "std"),
+        favorable_folds=(
+            "advantage_first_over_second",
+            lambda values: int((values > 0).sum()),
+        ),
+        tied_folds=(
+            "advantage_first_over_second",
+            lambda values: int(np.isclose(values, 0).sum()),
+        ),
+    )
+    .assign(
+        favorable_fold_percentage=lambda data: (
+            data["favorable_folds"] / (CV_SPLITS * CV_REPEATS) * 100
+        ),
+        comparison=lambda data: pd.Categorical(
+            data["comparison"], categories=comparison_order, ordered=True
+        ),
+        metric=lambda data: pd.Categorical(
+            data["metric"], categories=metric_order, ordered=True
+        ),
+    )
+    .sort_values(["comparison", "metric"])
+    .reset_index(drop=True)
+)
+
+display(paired_difference_summary)
+```
+
+### 14.3 Visualize paired Average Precision differences
+
+Each point represents one repeat-fold comparison. Values to the right of zero favor
+the first model named on the vertical axis. The larger diamond shows the mean paired
+advantage.
+
+```{python}
+average_precision_differences = paired_differences.loc[
+    paired_differences["metric"] == "average_precision"
+].copy()
+average_precision_differences["comparison"] = pd.Categorical(
+    average_precision_differences["comparison"],
+    categories=comparison_order,
+    ordered=True,
+)
+
+average_precision_means = (
+    average_precision_differences.groupby("comparison", observed=True)[
+        "advantage_first_over_second"
+    ]
+    .mean()
+    .reindex(comparison_order)
+)
+
+fig, ax = plt.subplots(figsize=(9, 5.5))
+sns.stripplot(
+    data=average_precision_differences,
+    x="advantage_first_over_second",
+    y="comparison",
+    order=comparison_order,
+    jitter=0.16,
+    alpha=0.60,
+    size=6,
+    color=RETENTION_COLOR,
+    ax=ax,
+)
+ax.scatter(
+    average_precision_means.to_numpy(),
+    np.arange(len(comparison_order)),
+    marker="D",
+    s=80,
+    color=ATTRITION_COLOR,
+    label="Mean paired advantage",
+    zorder=5,
+)
+ax.axvline(0, color="#222222", linestyle="--", linewidth=1.3)
+ax.set_xlabel("Paired Average Precision advantage: first model minus second")
+ax.set_ylabel("")
+ax.set_title("Incremental predictive value across identical validation folds")
+ax.legend(loc="lower right")
+plt.tight_layout()
+plt.show()
+plt.close(fig)
+```
+
+## Phase 8 interpretation checkpoint
+
+The key criterion is not merely whether the combined model has a positive mean
+advantage, but whether that advantage appears in most validation folds and across both
+discrimination and probability-quality metrics. The behavioral-versus-contextual
+comparison tells us which isolated block is stronger; the combined comparisons test
+whether integrating the blocks adds incremental predictive value.
+
+These paired summaries remain descriptive repeated-cross-validation evidence. They do
+not constitute independent observations or formal hypothesis tests, and the held-out
+test set remains untouched.
+
+## 15. Tune logistic regularization
+
+The combined specification is the candidate linear model because it improved all four
+metrics in every paired validation fold. We now tune its L2 regularization strength.
+The parameter `C` is the inverse of regularization strength:
+
+- smaller `C` values shrink coefficients more strongly;
+- larger `C` values allow more flexible, potentially less stable coefficients.
+
+The grid spans five orders of magnitude and contains the original baseline value
+`C = 1`. Every candidate is evaluated on the same 25 development folds. Average
+Precision remains the selection criterion; the other metrics are diagnostics rather
+than additional optimization targets.
+
+### 15.1 Search the prespecified grid
+
+```{python}
+from sklearn.model_selection import GridSearchCV
+
+LOGISTIC_C_GRID = [
+    0.001,
+    0.003,
+    0.01,
+    0.03,
+    0.1,
+    0.3,
+    1.0,
+    3.0,
+    10.0,
+    30.0,
+    100.0,
+]
+
+combined_logistic_search = GridSearchCV(
+    estimator=build_logistic_pipeline(COMBINED_PREDICTORS),
+    param_grid={"classifier__C": LOGISTIC_C_GRID},
+    scoring=CV_SCORING,
+    refit="average_precision",
+    cv=repeated_cv,
+    n_jobs=1,
+    return_train_score=False,
+    error_score="raise",
+)
+combined_logistic_search.fit(
+    development_df[COMBINED_PREDICTORS],
+    development_y,
+)
+
+selected_logistic_c = float(
+    combined_logistic_search.best_params_["classifier__C"]
+)
+
+logistic_tuning_results = (
+    pd.DataFrame(combined_logistic_search.cv_results_)
+    .loc[
+        :,
+        [
+            "param_classifier__C",
+            "rank_test_average_precision",
+            "mean_test_average_precision",
+            "std_test_average_precision",
+            "mean_test_roc_auc",
+            "std_test_roc_auc",
+            "mean_test_brier_score",
+            "std_test_brier_score",
+            "mean_test_log_loss",
+            "std_test_log_loss",
+        ],
+    ]
+    .rename(
+        columns={
+            "param_classifier__C": "C",
+            "rank_test_average_precision": "average_precision_rank",
+            "mean_test_average_precision": "average_precision_mean",
+            "std_test_average_precision": "average_precision_sd",
+            "mean_test_roc_auc": "roc_auc_mean",
+            "std_test_roc_auc": "roc_auc_sd",
+            "mean_test_brier_score": "brier_score_mean",
+            "std_test_brier_score": "brier_score_sd",
+            "mean_test_log_loss": "log_loss_mean",
+            "std_test_log_loss": "log_loss_sd",
+        }
+    )
+    .assign(
+        C=lambda data: data["C"].astype(float),
+        brier_score_mean=lambda data: -data["brier_score_mean"],
+        log_loss_mean=lambda data: -data["log_loss_mean"],
+        selected=lambda data: np.isclose(data["C"], selected_logistic_c),
+    )
+    .sort_values("C")
+    .reset_index(drop=True)
+)
+
+if selected_logistic_c in {min(LOGISTIC_C_GRID), max(LOGISTIC_C_GRID)}:
+    print(
+        "Warning: the selected C is on a grid boundary; the grid should be extended."
+    )
+else:
+    print("The selected C is internal to the search grid.")
+
+display(logistic_tuning_results)
+print(f"Selected regularization value: C = {selected_logistic_c:g}")
+```
+
+`GridSearchCV` refits the selected pipeline on the complete development sample after
+selection. This fitted object is convenient for later interpretation, but it has not
+seen the test set.
+
+### 15.2 Visualize the tuning trade-off
+
+The left panel shows the primary selection metric. The right panel checks whether the
+same regularization region also produces reasonable probability quality. Error bars
+show one standard deviation across validation folds, not confidence intervals.
+
+```{python}
+fig, axes = plt.subplots(1, 2, figsize=(13, 4.8))
+
+axes[0].errorbar(
+    logistic_tuning_results["C"],
+    logistic_tuning_results["average_precision_mean"],
+    yerr=logistic_tuning_results["average_precision_sd"],
+    marker="o",
+    color=RETENTION_COLOR,
+    ecolor="#7F8C8D",
+    capsize=3,
+)
+axes[0].axvline(
+    selected_logistic_c,
+    color=ATTRITION_COLOR,
+    linestyle="--",
+    label=f"Selected C = {selected_logistic_c:g}",
+)
+axes[0].set_xscale("log")
+axes[0].set_xlabel("C: inverse regularization strength")
+axes[0].set_ylabel("Validation Average Precision")
+axes[0].set_title("Primary selection metric")
+axes[0].legend()
+
+axes[1].errorbar(
+    logistic_tuning_results["C"],
+    logistic_tuning_results["brier_score_mean"],
+    yerr=logistic_tuning_results["brier_score_sd"],
+    marker="o",
+    color="#7D3C98",
+    ecolor="#7F8C8D",
+    capsize=3,
+)
+axes[1].axvline(
+    selected_logistic_c,
+    color=ATTRITION_COLOR,
+    linestyle="--",
+    label=f"Selected C = {selected_logistic_c:g}",
+)
+axes[1].set_xscale("log")
+axes[1].set_xlabel("C: inverse regularization strength")
+axes[1].set_ylabel("Validation Brier score (lower is better)")
+axes[1].set_title("Probability-quality diagnostic")
+axes[1].legend()
+
+fig.suptitle("Combined logistic performance across L2 regularization strengths")
+plt.tight_layout()
+plt.show()
+plt.close(fig)
+```
+
+## Phase 9 interpretation checkpoint
+
+The search selects `C = 1`, the value used in the initial combined baseline. Mean
+validation Average Precision is 0.637, with ROC-AUC 0.834, Brier score 0.093, and log
+loss 0.327. Performance rises as excessive shrinkage is relaxed, then forms a broad
+plateau around `C = 0.3` to `C = 3`; allowing still larger coefficients does not
+improve Average Precision or probability quality.
+
+This is a reassuring negative tuning result: the original regularization setting was
+already appropriate, and the model is not highly sensitive to a narrowly optimized
+value. Nevertheless, 0.637 is a selection-stage cross-validation estimate, not final
+generalization performance. Because the same resampling results selected `C`, we do not
+present it as an unbiased test estimate.
+
+## 16. Coefficient stability across development folds
+
+A single fitted coefficient table can look more certain than the data justify. We
+therefore refit the selected combined logistic pipeline in all 25 training folds and
+record every coefficient. Stable direction across resamples increases confidence that
+an association is not driven by one convenient split; frequent sign changes indicate
+weak, redundant, or sample-sensitive information.
+
+Interpretation remains conditional and predictive:
+
+- numeric and ordered coefficients represent a one-standard-deviation increase;
+- nominal coefficients compare one category with the omitted reference category;
+- positive coefficients correspond to higher modeled attrition log-odds;
+- coefficients are not causal effects and should not be converted into HR actions.
+
+Correlated tenure and compensation predictors can divide shared signal differently
+across folds. Regularization reduces this instability but does not make a coefficient
+causal or eliminate multicollinearity.
+
+### 16.1 Refit the selected pipeline in every training fold
+
+```{python}
+from sklearn.base import clone
+
+selected_combined_pipeline = build_logistic_pipeline(COMBINED_PREDICTORS)
+selected_combined_pipeline.set_params(classifier__C=selected_logistic_c)
+
+selected_full_development_model = clone(selected_combined_pipeline).fit(
+    development_df[COMBINED_PREDICTORS],
+    development_y,
+)
+
+reference_feature_names = selected_full_development_model.named_steps[
+    "preprocessor"
+].get_feature_names_out()
+
+combined_nominal_predictors = [
+    predictor
+    for predictor in COMBINED_PREDICTORS
+    if predictor in NOMINAL_PREDICTORS
+]
+combined_numeric_predictors = [
+    predictor
+    for predictor in COMBINED_PREDICTORS
+    if predictor not in NOMINAL_PREDICTORS
+]
+
+fitted_one_hot = (
+    selected_full_development_model.named_steps["preprocessor"]
+    .named_transformers_["nominal"]
+    .named_steps["one_hot"]
+)
+nominal_reference_categories = {
+    predictor: categories[int(drop_index)]
+    for predictor, categories, drop_index in zip(
+        combined_nominal_predictors,
+        fitted_one_hot.categories_,
+        fitted_one_hot.drop_idx_,
+    )
+}
+
+
+def describe_transformed_feature(feature_name):
+    """Map a transformed feature back to its source predictor and contrast."""
+    if feature_name in combined_numeric_predictors:
+        return {
+            "source_predictor": feature_name,
+            "feature_type": "Numeric or ordered",
+            "contrast": "One training-fold standard deviation increase",
+            "display_label": f"{feature_name} (per 1 SD)",
+        }
+
+    matching_predictors = [
+        predictor
+        for predictor in combined_nominal_predictors
+        if feature_name.startswith(f"{predictor}_")
+    ]
+    if len(matching_predictors) != 1:
+        raise ValueError(f"Cannot map transformed feature: {feature_name}")
+
+    source_predictor = matching_predictors[0]
+    category = feature_name[len(source_predictor) + 1 :]
+    reference_category = nominal_reference_categories[source_predictor]
+    return {
+        "source_predictor": source_predictor,
+        "feature_type": "Nominal indicator",
+        "contrast": f"{category} compared with {reference_category}",
+        "display_label": (
+            f"{source_predictor}: {category} (ref: {reference_category})"
+        ),
+    }
+
+
+feature_metadata = pd.DataFrame(
+    [
+        {
+            "transformed_feature": feature_name,
+            **describe_transformed_feature(feature_name),
+        }
+        for feature_name in reference_feature_names
+    ]
+)
+
+coefficient_fold_rows = []
+
+for split_number, (train_positions, validation_positions) in enumerate(
+    repeated_cv.split(
+        development_df[COMBINED_PREDICTORS],
+        development_y,
+    )
+):
+    fold_pipeline = clone(selected_combined_pipeline)
+    fold_pipeline.fit(
+        development_df.iloc[train_positions][COMBINED_PREDICTORS],
+        development_y.iloc[train_positions],
+    )
+
+    fold_feature_names = fold_pipeline.named_steps[
+        "preprocessor"
+    ].get_feature_names_out()
+    if not np.array_equal(fold_feature_names, reference_feature_names):
+        raise ValueError(
+            "Transformed feature definitions changed across folds; "
+            "coefficient rows cannot be aligned safely."
+        )
+
+    fold_coefficients = fold_pipeline.named_steps[
+        "classifier"
+    ].coef_.ravel()
+    if len(fold_coefficients) != len(reference_feature_names):
+        raise ValueError("Feature and coefficient counts do not match.")
+
+    for feature_name, coefficient in zip(
+        fold_feature_names,
+        fold_coefficients,
+    ):
+        coefficient_fold_rows.append(
+            {
+                "repeat": split_number // CV_SPLITS + 1,
+                "fold": split_number % CV_SPLITS + 1,
+                "transformed_feature": feature_name,
+                "coefficient": coefficient,
+            }
+        )
+
+coefficient_fold_results = pd.DataFrame(coefficient_fold_rows).merge(
+    feature_metadata,
+    on="transformed_feature",
+    how="left",
+    validate="many_to_one",
+)
+
+expected_coefficient_rows = (
+    CV_SPLITS * CV_REPEATS * len(reference_feature_names)
+)
+if len(coefficient_fold_results) != expected_coefficient_rows:
+    raise ValueError(
+        f"Expected {expected_coefficient_rows} coefficient rows; "
+        f"found {len(coefficient_fold_results)}."
+    )
+
+if set(coefficient_fold_results["source_predictor"]) & set(
+    SENSITIVE_AUDIT_VARIABLES
+):
+    raise ValueError("A sensitive audit variable entered the coefficient analysis.")
+
+print(
+    f"Recorded {len(reference_feature_names)} coefficients across "
+    f"{CV_SPLITS * CV_REPEATS} fitted training folds."
+)
+display(coefficient_fold_results.head(10))
+```
+
+The `validation_positions` are intentionally not used in this step: validation folds
+defined model comparison, while coefficient stability concerns how much the fitted
+parameters change when the training sample changes.
+
+### 16.2 Summarize direction and magnitude stability
+
+`sign_consistency_percentage` reports the percentage of folds agreeing with the most
+common coefficient direction. A large mean coefficient with low sign consistency is
+not a robust signal. The exponentiated mean coefficient is shown as a descriptive odds
+ratio on the model scale; it is not an unadjusted risk ratio or causal effect.
+
+```{python}
+coefficient_stability_summary = (
+    coefficient_fold_results.groupby(
+        [
+            "transformed_feature",
+            "source_predictor",
+            "feature_type",
+            "contrast",
+            "display_label",
+        ],
+        as_index=False,
+    )
+    .agg(
+        mean_coefficient=("coefficient", "mean"),
+        median_coefficient=("coefficient", "median"),
+        coefficient_sd=("coefficient", "std"),
+        minimum_coefficient=("coefficient", "min"),
+        maximum_coefficient=("coefficient", "max"),
+        positive_folds=("coefficient", lambda values: int((values > 0).sum())),
+        negative_folds=("coefficient", lambda values: int((values < 0).sum())),
+    )
+    .assign(
+        sign_consistency_percentage=lambda data: (
+            data[["positive_folds", "negative_folds"]].max(axis=1)
+            / (CV_SPLITS * CV_REPEATS)
+            * 100
+        ),
+        odds_ratio_from_mean=lambda data: np.exp(data["mean_coefficient"]),
+        absolute_mean_coefficient=lambda data: data["mean_coefficient"].abs(),
+        dominant_direction=lambda data: np.where(
+            data["mean_coefficient"] > 0,
+            "Higher modeled attrition",
+            "Lower modeled attrition",
+        ),
+    )
+    .sort_values(
+        ["absolute_mean_coefficient", "sign_consistency_percentage"],
+        ascending=[False, False],
+    )
+    .reset_index(drop=True)
+)
+
+coefficient_stability_display = coefficient_stability_summary.loc[
+    :14,
+    [
+        "display_label",
+        "feature_type",
+        "mean_coefficient",
+        "coefficient_sd",
+        "odds_ratio_from_mean",
+        "dominant_direction",
+        "sign_consistency_percentage",
+    ],
+]
+
+display(coefficient_stability_display)
+```
+
+### 16.3 Identify sample-sensitive directions
+
+This diagnostic lists the largest coefficients whose direction agrees in fewer than
+80% of folds. These terms should not receive substantive interpretation even if their
+full-development coefficient looks interesting.
+
+```{python}
+unstable_coefficient_summary = coefficient_stability_summary.loc[
+    coefficient_stability_summary["sign_consistency_percentage"] < 80,
+    [
+        "display_label",
+        "mean_coefficient",
+        "coefficient_sd",
+        "minimum_coefficient",
+        "maximum_coefficient",
+        "sign_consistency_percentage",
+    ],
+].head(10)
+
+display(unstable_coefficient_summary)
+```
+
+### 16.4 Visualize the strongest conditional associations
+
+The chart displays the 15 largest absolute mean coefficients. Error bars represent one
+standard deviation across fitted folds, not inferential confidence intervals. Numeric
+contrasts correspond to one training-fold standard deviation; categorical contrasts
+use the stated reference category.
+
+```{python}
+coefficient_plot_data = (
+    coefficient_stability_summary.head(15)
+    .sort_values("mean_coefficient")
+    .reset_index(drop=True)
+)
+
+fig, ax = plt.subplots(figsize=(11, 7.5))
+y_positions = np.arange(len(coefficient_plot_data))
+coefficient_colors = np.where(
+    coefficient_plot_data["mean_coefficient"] > 0,
+    ATTRITION_COLOR,
+    RETENTION_COLOR,
+)
+
+for row_position, row in coefficient_plot_data.iterrows():
+    ax.errorbar(
+        row["mean_coefficient"],
+        row_position,
+        xerr=row["coefficient_sd"],
+        fmt="o",
+        color=coefficient_colors[row_position],
+        ecolor="#7F8C8D",
+        capsize=3,
+        markersize=7,
+    )
+
+ax.axvline(0, color="#222222", linestyle="--", linewidth=1.2)
+ax.set_yticks(y_positions, coefficient_plot_data["display_label"])
+ax.set_xlabel("Mean regularized log-odds coefficient across training folds")
+ax.set_ylabel("")
+ax.set_title(
+    "Strongest combined-logistic associations and resampling stability"
+)
+plt.tight_layout()
+plt.show()
+plt.close(fig)
+```
+
+## Phase 10 interpretation checkpoint
+
+The coefficient audit records 37 transformed terms across 25 training folds, producing
+925 aligned estimates. The largest stable positive conditional associations are
+overtime (mean coefficient 1.691; exponentiated coefficient 5.423), frequent business
+travel relative to no travel (1.447; 4.250), Laboratory Technician relative to
+Healthcare Representative (1.297; 3.660), and Sales Representative relative to
+Healthcare Representative (0.951; 2.588). Their signs agree in all 25 folds.
+
+Stable negative associations include total working years per training-fold standard
+deviation (-0.847; 0.429), stock-option level per standard deviation (-0.550; 0.577),
+environment satisfaction per standard deviation (-0.459; 0.632), and job satisfaction
+per standard deviation (-0.410; 0.664). These values are conditional on all other
+included predictors and should not be read as unadjusted comparisons.
+
+Years since last promotion illustrates why descriptive and multivariable results must
+be separated. Its bivariate shift was small, while its adjusted mean coefficient is
+positive (0.504; 1.655) in all folds. Because years since promotion overlaps strongly
+with total tenure, company tenure, role tenure, and manager tenure, this sign can reflect
+suppression or redistribution of shared information. It is not evidence that delaying
+promotion causes attrition.
+
+Manufacturing Director and Sales Executive role indicators, education level, Manager
+role, and Marketing education field change sign frequently. Their mean coefficients
+are also small relative to their fold variation, so they do not support a stable
+directional narrative. Predictors with small or unstable individual coefficients may
+still contribute jointly to prediction.
+
+Category odds ratios depend on the stated reference group. Some references, such as
+the Human Resources education field, have small samples; comparisons against them
+require particular caution. Overall, the coefficient analysis is suitable for
+explaining model structure, not for causal or personnel-level conclusions in this
+synthetic observational dataset.
+
+## 17. Nested comparison with XGBoost
+
+Logistic regression assumes additive linear relationships on the log-odds scale.
+XGBoost can represent thresholds, nonlinearities, and interactions without specifying
+them manually. That flexibility can improve prediction, but it also increases the risk
+of overfitting this relatively small sample.
+
+We therefore use **nested cross-validation**:
+
+1. the same 25 outer folds estimate validation performance;
+2. inside each outer training sample, three-fold stratified cross-validation chooses
+   among eight prespecified XGBoost configurations;
+3. the selected configuration is refitted on that outer training sample;
+4. predictions are generated for the untouched outer validation fold.
+
+The outer validation observations do not participate in preprocessing or
+hyperparameter selection. The fixed `C = 1` combined logistic pipeline serves as the
+linear benchmark on the identical outer folds.
+
+### 17.1 Define a tree-specific preprocessing pipeline
+
+Tree models do not require standardization. Numeric variables are median-imputed;
+nominal variables are mode-imputed and fully one-hot encoded. Unlike the logistic
+pipeline, no category is dropped because trees do not require a reference level.
+
+```{python}
+from sklearn.metrics import (
+    average_precision_score,
+    brier_score_loss,
+    log_loss,
+    roc_auc_score,
+)
+from sklearn.model_selection import StratifiedKFold
+from xgboost import XGBClassifier
+
+
+def build_xgboost_pipeline():
+    """Build a leakage-safe XGBoost pipeline for the combined predictors."""
+    numeric_pipeline = Pipeline(
+        steps=[("imputer", SimpleImputer(strategy="median"))]
+    )
+    nominal_pipeline = Pipeline(
+        steps=[
+            ("imputer", SimpleImputer(strategy="most_frequent")),
+            (
+                "one_hot",
+                OneHotEncoder(
+                    drop=None,
+                    handle_unknown="ignore",
+                    sparse_output=True,
+                ),
+            ),
+        ]
+    )
+
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ("numeric", numeric_pipeline, combined_numeric_predictors),
+            ("nominal", nominal_pipeline, combined_nominal_predictors),
+        ],
+        remainder="drop",
+        verbose_feature_names_out=False,
+    )
+
+    classifier = XGBClassifier(
+        objective="binary:logistic",
+        eval_metric="logloss",
+        tree_method="hist",
+        n_jobs=1,
+        random_state=RANDOM_SEED,
+        verbosity=0,
+    )
+
+    return Pipeline(
+        steps=[
+            ("preprocessor", preprocessor),
+            ("classifier", classifier),
+        ]
+    )
+```
+
+As with logistic regression, outcome class weights remain unchanged. This keeps the
+fitted probabilities tied to the observed development prevalence; threshold selection
+will be treated as a separate decision problem.
+
+### 17.2 Prespecify candidate configurations
+
+The candidates span shallow to moderately deep trees, different learning rates, and
+different levels of row sampling, column sampling, and regularization. The bounded
+search is deliberate: with only 190 development attrition cases, an expansive search
+would increase selection noise without creating new information.
+
+```{python}
+INNER_CV_SPLITS = 3
+
+XGB_CANDIDATES = [
+    {
+        "candidate": "Shallow, strongly regularized",
+        "parameters": {
+            "n_estimators": 200,
+            "learning_rate": 0.03,
+            "max_depth": 2,
+            "min_child_weight": 5,
+            "subsample": 0.80,
+            "colsample_bytree": 0.80,
+            "reg_lambda": 10.0,
+            "reg_alpha": 1.0,
+            "gamma": 0.10,
+        },
+    },
+    {
+        "candidate": "Shallow, moderate",
+        "parameters": {
+            "n_estimators": 150,
+            "learning_rate": 0.05,
+            "max_depth": 2,
+            "min_child_weight": 3,
+            "subsample": 0.90,
+            "colsample_bytree": 0.90,
+            "reg_lambda": 5.0,
+            "reg_alpha": 0.10,
+            "gamma": 0.00,
+        },
+    },
+    {
+        "candidate": "Shallow, faster learning",
+        "parameters": {
+            "n_estimators": 100,
+            "learning_rate": 0.10,
+            "max_depth": 2,
+            "min_child_weight": 3,
+            "subsample": 1.00,
+            "colsample_bytree": 1.00,
+            "reg_lambda": 5.0,
+            "reg_alpha": 0.10,
+            "gamma": 0.00,
+        },
+    },
+    {
+        "candidate": "Balanced, strongly regularized",
+        "parameters": {
+            "n_estimators": 200,
+            "learning_rate": 0.03,
+            "max_depth": 3,
+            "min_child_weight": 5,
+            "subsample": 0.80,
+            "colsample_bytree": 0.80,
+            "reg_lambda": 10.0,
+            "reg_alpha": 0.50,
+            "gamma": 0.10,
+        },
+    },
+    {
+        "candidate": "Balanced, moderate",
+        "parameters": {
+            "n_estimators": 150,
+            "learning_rate": 0.05,
+            "max_depth": 3,
+            "min_child_weight": 3,
+            "subsample": 0.90,
+            "colsample_bytree": 0.90,
+            "reg_lambda": 5.0,
+            "reg_alpha": 0.10,
+            "gamma": 0.00,
+        },
+    },
+    {
+        "candidate": "Balanced, faster learning",
+        "parameters": {
+            "n_estimators": 100,
+            "learning_rate": 0.10,
+            "max_depth": 3,
+            "min_child_weight": 3,
+            "subsample": 0.80,
+            "colsample_bytree": 0.80,
+            "reg_lambda": 5.0,
+            "reg_alpha": 0.10,
+            "gamma": 0.10,
+        },
+    },
+    {
+        "candidate": "Deep, strongly regularized",
+        "parameters": {
+            "n_estimators": 200,
+            "learning_rate": 0.03,
+            "max_depth": 4,
+            "min_child_weight": 5,
+            "subsample": 0.80,
+            "colsample_bytree": 0.80,
+            "reg_lambda": 10.0,
+            "reg_alpha": 1.00,
+            "gamma": 0.10,
+        },
+    },
+    {
+        "candidate": "Deep, flexible",
+        "parameters": {
+            "n_estimators": 150,
+            "learning_rate": 0.05,
+            "max_depth": 4,
+            "min_child_weight": 1,
+            "subsample": 0.90,
+            "colsample_bytree": 0.90,
+            "reg_lambda": 1.0,
+            "reg_alpha": 0.00,
+            "gamma": 0.00,
+        },
+    },
+]
+
+XGB_PARAMETER_GRID = [
+    {
+        f"classifier__{parameter}": [value]
+        for parameter, value in candidate["parameters"].items()
+    }
+    for candidate in XGB_CANDIDATES
+]
+
+XGB_CANDIDATE_LOOKUP = {
+    tuple(sorted(candidate["parameters"].items())): candidate["candidate"]
+    for candidate in XGB_CANDIDATES
+}
+
+xgb_candidate_summary = pd.DataFrame(
+    [
+        {"candidate": candidate["candidate"], **candidate["parameters"]}
+        for candidate in XGB_CANDIDATES
+    ]
+)
+display(xgb_candidate_summary)
+```
+
+### 17.3 Run nested cross-validation
+
+This is the most computationally intensive section. It fits 8 candidates across 3
+inner folds for each of 25 outer folds, plus one refit of the selected candidate per
+outer fold. Progress messages make the execution visible without printing every fit.
+
+```{python}
+xgb_nested_rows = []
+xgb_outer_predictions = []
+
+for split_number, (train_positions, validation_positions) in enumerate(
+    repeated_cv.split(
+        development_df[COMBINED_PREDICTORS],
+        development_y,
+    )
+):
+    inner_cv = StratifiedKFold(
+        n_splits=INNER_CV_SPLITS,
+        shuffle=True,
+        random_state=RANDOM_SEED + split_number,
+    )
+    xgb_search = GridSearchCV(
+        estimator=build_xgboost_pipeline(),
+        param_grid=XGB_PARAMETER_GRID,
+        scoring=CV_SCORING,
+        refit="average_precision",
+        cv=inner_cv,
+        n_jobs=1,
+        return_train_score=False,
+        error_score="raise",
+    )
+
+    outer_train_x = development_df.iloc[train_positions][COMBINED_PREDICTORS]
+    outer_train_y = development_y.iloc[train_positions]
+    outer_validation_x = development_df.iloc[validation_positions][
+        COMBINED_PREDICTORS
+    ]
+    outer_validation_y = development_y.iloc[validation_positions]
+
+    xgb_search.fit(outer_train_x, outer_train_y)
+    outer_probabilities = xgb_search.predict_proba(outer_validation_x)[:, 1]
+
+    selected_parameters = {
+        parameter.replace("classifier__", ""): value
+        for parameter, value in xgb_search.best_params_.items()
+    }
+    candidate_key = tuple(sorted(selected_parameters.items()))
+    selected_candidate = XGB_CANDIDATE_LOOKUP[candidate_key]
+
+    repeat_number = split_number // CV_SPLITS + 1
+    fold_number = split_number % CV_SPLITS + 1
+    xgb_nested_rows.append(
+        {
+            "repeat": repeat_number,
+            "fold": fold_number,
+            "selected_candidate": selected_candidate,
+            "inner_average_precision": xgb_search.best_score_,
+            "average_precision": average_precision_score(
+                outer_validation_y, outer_probabilities
+            ),
+            "roc_auc": roc_auc_score(
+                outer_validation_y, outer_probabilities
+            ),
+            "brier_score": brier_score_loss(
+                outer_validation_y, outer_probabilities
+            ),
+            "log_loss": log_loss(
+                outer_validation_y, outer_probabilities,
+                labels=[0, 1],
+            ),
+        }
+    )
+
+    for row_index, observed, probability in zip(
+        development_df.index[validation_positions],
+        outer_validation_y,
+        outer_probabilities,
+    ):
+        xgb_outer_predictions.append(
+            {
+                "repeat": repeat_number,
+                "fold": fold_number,
+                "row_index": row_index,
+                "observed_attrition": int(observed),
+                "predicted_probability": probability,
+            }
+        )
+
+    print(
+        f"Completed outer fold {split_number + 1}/"
+        f"{CV_SPLITS * CV_REPEATS}",
+        end="\r",
+    )
+
+print()
+xgb_nested_results = pd.DataFrame(xgb_nested_rows)
+xgb_development_predictions = pd.DataFrame(xgb_outer_predictions)
+
+if len(xgb_nested_results) != CV_SPLITS * CV_REPEATS:
+    raise ValueError("Nested XGBoost evaluation did not produce 25 outer results.")
+
+expected_prediction_rows = len(development_df) * CV_REPEATS
+if len(xgb_development_predictions) != expected_prediction_rows:
+    raise ValueError(
+        f"Expected {expected_prediction_rows} outer predictions; "
+        f"found {len(xgb_development_predictions)}."
+    )
+
+if not np.isfinite(
+    xgb_development_predictions["predicted_probability"]
+).all():
+    raise ValueError("Nested XGBoost produced non-finite probabilities.")
+
+display(xgb_nested_results.head(10))
+```
+
+### 17.4 Audit selected tree configurations
+
+Selection counts reveal whether one configuration dominates or whether small changes
+in the outer training sample lead to different hyperparameters. Frequent switching is
+evidence of tuning uncertainty, even when predictive performance is stable.
+
+```{python}
+xgb_candidate_selection_summary = (
+    xgb_nested_results["selected_candidate"]
+    .value_counts()
+    .reindex(xgb_candidate_summary["candidate"], fill_value=0)
+    .rename_axis("candidate")
+    .reset_index(name="selected_outer_folds")
+)
+xgb_candidate_selection_summary["selection_percentage"] = (
+    xgb_candidate_selection_summary["selected_outer_folds"]
+    / (CV_SPLITS * CV_REPEATS)
+    * 100
+)
+
+display(xgb_candidate_selection_summary)
+```
+
+### 17.5 Compare nested XGBoost with the fixed logistic benchmark
+
+The comparison is paired on repeat and fold. Positive advantages always favor XGBoost:
+for Average Precision and ROC-AUC we calculate `XGBoost - logistic`; for Brier score
+and log loss we calculate `logistic - XGBoost` because lower is better.
+
+```{python}
+logistic_outer_results = cv_model_results.loc[
+    cv_model_results["model"] == "Combined logistic",
+    [
+        "repeat",
+        "fold",
+        "average_precision",
+        "roc_auc",
+        "brier_score",
+        "log_loss",
+    ],
+]
+
+xgb_logistic_paired = xgb_nested_results.merge(
+    logistic_outer_results,
+    on=["repeat", "fold"],
+    suffixes=("_xgboost", "_logistic"),
+    validate="one_to_one",
+)
+
+xgb_logistic_difference_rows = []
+for metric, preferred_direction in METRIC_DIRECTIONS.items():
+    raw_difference = (
+        xgb_logistic_paired[f"{metric}_xgboost"]
+        - xgb_logistic_paired[f"{metric}_logistic"]
+    )
+    xgb_advantage = (
+        raw_difference if preferred_direction == "higher"
+        else -raw_difference
+    )
+    for row_position, row in xgb_logistic_paired.iterrows():
+        xgb_logistic_difference_rows.append(
+            {
+                "repeat": int(row["repeat"]),
+                "fold": int(row["fold"]),
+                "metric": metric,
+                "xgboost_advantage": xgb_advantage.loc[row_position],
+            }
+        )
+
+xgb_logistic_differences = pd.DataFrame(xgb_logistic_difference_rows)
+
+xgb_logistic_comparison_summary = (
+    xgb_logistic_differences.groupby("metric", as_index=False)
+    .agg(
+        mean_xgboost_advantage=("xgboost_advantage", "mean"),
+        median_xgboost_advantage=("xgboost_advantage", "median"),
+        advantage_sd=("xgboost_advantage", "std"),
+        xgboost_favorable_folds=(
+            "xgboost_advantage", lambda values: int((values > 0).sum())
+        ),
+        tied_folds=(
+            "xgboost_advantage", lambda values: int(np.isclose(values, 0).sum())
+        ),
+    )
+    .assign(
+        xgboost_favorable_fold_percentage=lambda data: (
+            data["xgboost_favorable_folds"]
+            / (CV_SPLITS * CV_REPEATS)
+            * 100
+        ),
+        metric=lambda data: pd.Categorical(
+            data["metric"], categories=metric_order, ordered=True
+        ),
+    )
+    .sort_values("metric")
+    .reset_index(drop=True)
+)
+
+nested_model_performance_summary = pd.DataFrame(
+    [
+        {
+            "model": "Combined logistic",
+            **{
+                f"{metric}_mean": logistic_outer_results[metric].mean()
+                for metric in METRIC_DIRECTIONS
+            },
+        },
+        {
+            "model": "Nested XGBoost",
+            **{
+                f"{metric}_mean": xgb_nested_results[metric].mean()
+                for metric in METRIC_DIRECTIONS
+            },
+        },
+    ]
+)
+
+display(nested_model_performance_summary)
+display(xgb_logistic_comparison_summary)
+```
+
+### 17.6 Visualize the paired primary-metric comparison
+
+Each point is XGBoost Average Precision minus logistic Average Precision on the same
+outer validation fold. Values right of zero favor XGBoost; the diamond is the mean.
+
+```{python}
+xgb_ap_differences = xgb_logistic_differences.loc[
+    xgb_logistic_differences["metric"] == "average_precision",
+    "xgboost_advantage",
+]
+
+fig, ax = plt.subplots(figsize=(9, 3.4))
+sns.stripplot(
+    x=xgb_ap_differences,
+    jitter=0.12,
+    alpha=0.65,
+    size=7,
+    color=RETENTION_COLOR,
+    ax=ax,
+)
+ax.scatter(
+    xgb_ap_differences.mean(),
+    0,
+    marker="D",
+    s=90,
+    color=ATTRITION_COLOR,
+    label="Mean paired advantage",
+    zorder=5,
+)
+ax.axvline(0, color="#222222", linestyle="--", linewidth=1.3)
+ax.set_xlabel("Paired Average Precision advantage: XGBoost minus logistic")
+ax.set_yticks([])
+ax.set_title("Does nested XGBoost improve on the combined logistic benchmark?")
+ax.legend(loc="lower right")
+plt.tight_layout()
+plt.show()
+plt.close(fig)
+```
+
+## Phase 11 interpretation checkpoint
+
+Nested XGBoost does not improve on the fixed combined logistic benchmark. Its mean
+outer-fold Average Precision is 0.607 compared with 0.637 for logistic regression, a
+mean paired disadvantage of 0.030. XGBoost performs better in only 7 of 25 Average
+Precision comparisons (28%). ROC-AUC is also lower on average (0.825 versus 0.834),
+with XGBoost favorable in 10 folds (40%).
+
+Probability-quality metrics reach the same conclusion. Mean Brier score is 0.097 for
+XGBoost and 0.093 for logistic regression, while mean log loss is 0.330 and 0.327,
+respectively. XGBoost is favorable in only 7 Brier comparisons and 9 log-loss
+comparisons. The differences are not enormous, but there is no compensating predictive
+benefit for the nonlinear model's additional complexity.
+
+The `Balanced, faster learning` configuration is selected in 17 of 25 outer folds
+(68%). Shallow alternatives account for six selections and the moderate balanced
+configuration for two. None of the strongly regularized or deeper configurations is
+selected. This pattern suggests that modest tree complexity is sufficient, but even
+the best internally selected trees do not surpass the additive regularized model.
+
+We therefore retain the combined logistic regression with `C = 1` as the primary
+model. This choice is evidence-based rather than a preference for simplicity: it has
+better outer-fold discrimination, better probability quality, lower computational
+cost, and more transparent conditional associations. XGBoost remains a documented
+negative benchmark rather than the final modeling strategy.
+
+Nested cross-validation supplies development-stage comparison evidence; the held-out
+test set remains sealed. After selecting the final modeling strategy, all remaining
+choices will be frozen before the test set is evaluated once.
+
+## 18. Out-of-fold calibration and threshold analysis
+
+The combined logistic model is now frozen as the primary strategy with `C = 1`. Before
+opening the test set, we create repeated out-of-fold probabilities for every development
+employee. Each probability is produced by a model that did not train on that employee.
+Because five-fold cross-validation was repeated five times, each employee receives five
+such probabilities; their mean becomes one leakage-resistant development estimate.
+
+These probabilities support two distinct questions:
+
+- **Calibration:** do predicted probabilities match observed frequencies?
+- **Threshold behavior:** what trade-off between recall, precision, and specificity
+  results from converting probabilities into binary flags?
+
+### 18.1 Generate repeated out-of-fold logistic probabilities
+
+```{python}
+logistic_oof_rows = []
+
+for split_number, (train_positions, validation_positions) in enumerate(
+    repeated_cv.split(
+        development_df[COMBINED_PREDICTORS],
+        development_y,
+    )
+):
+    fold_pipeline = clone(selected_combined_pipeline)
+    fold_pipeline.fit(
+        development_df.iloc[train_positions][COMBINED_PREDICTORS],
+        development_y.iloc[train_positions],
+    )
+    validation_probabilities = fold_pipeline.predict_proba(
+        development_df.iloc[validation_positions][COMBINED_PREDICTORS]
+    )[:, 1]
+
+    repeat_number = split_number // CV_SPLITS + 1
+    fold_number = split_number % CV_SPLITS + 1
+    for row_index, observed, probability in zip(
+        development_df.index[validation_positions],
+        development_y.iloc[validation_positions],
+        validation_probabilities,
+    ):
+        logistic_oof_rows.append(
+            {
+                "repeat": repeat_number,
+                "fold": fold_number,
+                "row_index": row_index,
+                "observed_attrition": int(observed),
+                "predicted_probability": probability,
+            }
+        )
+
+logistic_oof_predictions = pd.DataFrame(logistic_oof_rows)
+
+expected_oof_rows = len(development_df) * CV_REPEATS
+if len(logistic_oof_predictions) != expected_oof_rows:
+    raise ValueError(
+        f"Expected {expected_oof_rows} repeated out-of-fold predictions; "
+        f"found {len(logistic_oof_predictions)}."
+    )
+
+outcome_consistency = logistic_oof_predictions.groupby("row_index")[
+    "observed_attrition"
+].nunique()
+if not outcome_consistency.eq(1).all():
+    raise ValueError("At least one employee has inconsistent outcome labels.")
+
+development_oof_predictions = (
+    logistic_oof_predictions.groupby("row_index", as_index=False)
+    .agg(
+        observed_attrition=("observed_attrition", "first"),
+        predicted_probability=("predicted_probability", "mean"),
+        prediction_sd=("predicted_probability", "std"),
+        n_oof_predictions=("predicted_probability", "size"),
+    )
+    .sort_values("row_index")
+    .reset_index(drop=True)
+)
+
+if len(development_oof_predictions) != len(development_df):
+    raise ValueError("Not every development employee has one aggregated OOF row.")
+
+if not development_oof_predictions["n_oof_predictions"].eq(CV_REPEATS).all():
+    raise ValueError("Every employee should have exactly five OOF probabilities.")
+
+display(development_oof_predictions.head(10))
+print(
+    "Mean within-employee SD across repeated OOF probabilities: "
+    f"{development_oof_predictions['prediction_sd'].mean():.3f}"
+)
+```
+
+The within-employee standard deviation is a prediction-stability diagnostic: it shows
+how much an employee's estimated probability changes when the training sample changes.
+It is not an individual confidence interval.
+
+### 18.2 Quantify development calibration
+
+An ideal calibration intercept is 0 and an ideal slope is 1. A slope below 1 indicates
+predictions that are too extreme; a slope above 1 indicates insufficient spread. We
+estimate these values by fitting a secondary logistic recalibration equation to the
+out-of-fold logits. This is a diagnostic only—the predictions are not recalibrated yet.
+
+```{python}
+oof_observed = development_oof_predictions["observed_attrition"].to_numpy()
+oof_probabilities = development_oof_predictions[
+    "predicted_probability"
+].to_numpy()
+
+probability_epsilon = 1e-6
+clipped_oof_probabilities = np.clip(
+    oof_probabilities,
+    probability_epsilon,
+    1 - probability_epsilon,
+)
+oof_logits = np.log(
+    clipped_oof_probabilities / (1 - clipped_oof_probabilities)
+).reshape(-1, 1)
+
+calibration_model = LogisticRegression(
+    C=1_000_000,
+    solver="lbfgs",
+    max_iter=2_000,
+).fit(oof_logits, oof_observed)
+
+calibration_intercept = float(calibration_model.intercept_[0])
+calibration_slope = float(calibration_model.coef_[0, 0])
+
+oof_calibration_summary = pd.DataFrame(
+    {
+        "metric": [
+            "Observed attrition rate",
+            "Mean predicted probability",
+            "Average Precision",
+            "ROC-AUC",
+            "Brier score",
+            "Log loss",
+            "Calibration intercept - ideal 0",
+            "Calibration slope - ideal 1",
+            "Mean prediction SD across repeats",
+        ],
+        "estimate": [
+            oof_observed.mean(),
+            oof_probabilities.mean(),
+            average_precision_score(oof_observed, oof_probabilities),
+            roc_auc_score(oof_observed, oof_probabilities),
+            brier_score_loss(oof_observed, oof_probabilities),
+            log_loss(oof_observed, oof_probabilities, labels=[0, 1]),
+            calibration_intercept,
+            calibration_slope,
+            development_oof_predictions["prediction_sd"].mean(),
+        ],
+    }
+)
+
+display(oof_calibration_summary)
+```
+
+### 18.3 Build a quantile calibration table and reliability plot
+
+Quantile bins contain approximately equal numbers of employees. This avoids tiny bins
+in high-probability regions, although the number of attrition cases can still vary.
+Points above the diagonal indicate observed attrition greater than predicted; points
+below it indicate overprediction.
+
+```{python}
+calibration_source = development_oof_predictions.copy()
+calibration_source["probability_bin"] = pd.qcut(
+    calibration_source["predicted_probability"],
+    q=10,
+    duplicates="drop",
+)
+
+oof_calibration_bins = (
+    calibration_source.groupby("probability_bin", observed=True)
+    .agg(
+        employees=("observed_attrition", "size"),
+        attrition_cases=("observed_attrition", "sum"),
+        mean_predicted_probability=("predicted_probability", "mean"),
+        observed_attrition_rate=("observed_attrition", "mean"),
+        minimum_probability=("predicted_probability", "min"),
+        maximum_probability=("predicted_probability", "max"),
+    )
+    .reset_index(drop=True)
+)
+oof_calibration_bins.insert(
+    0,
+    "bin",
+    np.arange(1, len(oof_calibration_bins) + 1),
+)
+
+display(oof_calibration_bins)
+
+fig, axes = plt.subplots(
+    1,
+    2,
+    figsize=(13, 5),
+    gridspec_kw={"width_ratios": [1.15, 1]},
+)
+
+maximum_calibration_axis = max(
+    oof_calibration_bins["mean_predicted_probability"].max(),
+    oof_calibration_bins["observed_attrition_rate"].max(),
+) * 1.08
+axes[0].plot(
+    [0, maximum_calibration_axis],
+    [0, maximum_calibration_axis],
+    linestyle="--",
+    color="#222222",
+    label="Perfect calibration",
+)
+axes[0].plot(
+    oof_calibration_bins["mean_predicted_probability"],
+    oof_calibration_bins["observed_attrition_rate"],
+    marker="o",
+    color=RETENTION_COLOR,
+    linewidth=1.8,
+    label="Combined logistic",
+)
+for _, row in oof_calibration_bins.iterrows():
+    axes[0].annotate(
+        str(int(row["attrition_cases"])),
+        (
+            row["mean_predicted_probability"],
+            row["observed_attrition_rate"],
+        ),
+        xytext=(4, 5),
+        textcoords="offset points",
+        fontsize=8,
+    )
+axes[0].set_xlim(0, maximum_calibration_axis)
+axes[0].set_ylim(0, maximum_calibration_axis)
+axes[0].set_xlabel("Mean out-of-fold predicted probability")
+axes[0].set_ylabel("Observed attrition rate")
+axes[0].set_title("Reliability by probability decile\n(labels are attrition cases)")
+axes[0].legend(loc="upper left")
+
+axes[1].hist(
+    development_oof_predictions.loc[
+        development_oof_predictions["observed_attrition"] == 0,
+        "predicted_probability",
+    ],
+    bins=np.linspace(0, 1, 21),
+    alpha=0.65,
+    color=RETENTION_COLOR,
+    label="Stayed",
+)
+axes[1].hist(
+    development_oof_predictions.loc[
+        development_oof_predictions["observed_attrition"] == 1,
+        "predicted_probability",
+    ],
+    bins=np.linspace(0, 1, 21),
+    alpha=0.70,
+    color=ATTRITION_COLOR,
+    label="Left",
+)
+axes[1].set_xlabel("Mean out-of-fold predicted probability")
+axes[1].set_ylabel("Employees")
+axes[1].set_title("Probability distributions overlap")
+axes[1].legend()
+
+fig.suptitle("Development-set calibration and probability separation")
+plt.tight_layout()
+plt.show()
+plt.close(fig)
+```
+
+### 18.4 Evaluate threshold trade-offs
+
+A threshold does not improve the probability model; it encodes a decision rule. Lower
+thresholds flag more employees and increase recall, but also create more false
+positives. Higher thresholds do the reverse.
+
+```{python}
+def safe_ratio(numerator, denominator):
+    return numerator / denominator if denominator else np.nan
+
+
+def calculate_threshold_metrics(observed, probabilities, threshold):
+    predicted = probabilities >= threshold
+    true_positive = int(((predicted == 1) & (observed == 1)).sum())
+    false_positive = int(((predicted == 1) & (observed == 0)).sum())
+    true_negative = int(((predicted == 0) & (observed == 0)).sum())
+    false_negative = int(((predicted == 0) & (observed == 1)).sum())
+
+    precision = safe_ratio(true_positive, true_positive + false_positive)
+    recall = safe_ratio(true_positive, true_positive + false_negative)
+    specificity = safe_ratio(true_negative, true_negative + false_positive)
+    f1 = safe_ratio(2 * precision * recall, precision + recall)
+
+    return {
+        "threshold": threshold,
+        "flagged_employees": int(predicted.sum()),
+        "flagged_percentage": predicted.mean() * 100,
+        "true_positive": true_positive,
+        "false_positive": false_positive,
+        "true_negative": true_negative,
+        "false_negative": false_negative,
+        "precision": precision,
+        "recall": recall,
+        "specificity": specificity,
+        "f1": f1,
+        "balanced_accuracy": np.mean([recall, specificity]),
+    }
+
+
+THRESHOLD_GRID = np.round(np.arange(0.05, 0.81, 0.01), 2)
+threshold_performance = pd.DataFrame(
+    [
+        calculate_threshold_metrics(
+            oof_observed,
+            oof_probabilities,
+            threshold,
+        )
+        for threshold in THRESHOLD_GRID
+    ]
+)
+
+display(threshold_performance.head(10))
+```
+
+### 18.5 Compare illustrative threshold scenarios
+
+The scenarios below are analytical examples, not recommended employment policies:
+
+- **0.50 default:** conventional but not cost-sensitive;
+- **maximum F1:** balances precision and recall mathematically;
+- **recall at least 70%:** prioritizes finding more observed attrition cases;
+- **20% review capacity:** flags approximately one fifth of employees.
+
+```{python}
+maximum_f1_threshold = float(
+    threshold_performance.loc[
+        threshold_performance["f1"].idxmax(), "threshold"
+    ]
+)
+
+recall_eligible_thresholds = threshold_performance.loc[
+    threshold_performance["recall"] >= 0.70
+]
+if recall_eligible_thresholds.empty:
+    raise ValueError("No threshold satisfies the 70% recall scenario.")
+recall_70_threshold = float(
+    recall_eligible_thresholds.sort_values(
+        ["precision", "threshold"],
+        ascending=[False, False],
+    ).iloc[0]["threshold"]
+)
+
+capacity_20_threshold = float(
+    np.quantile(oof_probabilities, 0.80, method="higher")
+)
+
+threshold_scenarios = pd.DataFrame(
+    [
+        {
+            "scenario": "Conventional 0.50",
+            "rationale": "Familiar default; no business-cost justification",
+            **calculate_threshold_metrics(
+                oof_observed, oof_probabilities, 0.50
+            ),
+        },
+        {
+            "scenario": "Maximum development F1",
+            "rationale": "Statistical precision-recall balance",
+            **calculate_threshold_metrics(
+                oof_observed, oof_probabilities, maximum_f1_threshold
+            ),
+        },
+        {
+            "scenario": "At least 70% recall",
+            "rationale": "Prioritizes sensitivity to observed attrition",
+            **calculate_threshold_metrics(
+                oof_observed, oof_probabilities, recall_70_threshold
+            ),
+        },
+        {
+            "scenario": "Approximately 20% review capacity",
+            "rationale": "Illustrative resource-constrained review volume",
+            **calculate_threshold_metrics(
+                oof_observed, oof_probabilities, capacity_20_threshold
+            ),
+        },
+    ]
+)
+
+display(threshold_scenarios)
+```
+
+### 18.6 Visualize the threshold trade-off
+
+```{python}
+fig, ax = plt.subplots(figsize=(10, 5.5))
+
+for metric, color in {
+    "precision": RETENTION_COLOR,
+    "recall": ATTRITION_COLOR,
+    "specificity": "#7D3C98",
+    "f1": "#D68910",
+}.items():
+    ax.plot(
+        threshold_performance["threshold"],
+        threshold_performance[metric],
+        label=metric.replace("_", " ").title(),
+        color=color,
+        linewidth=2,
+    )
+
+ax.axvline(
+    0.50,
+    color="#566573",
+    linestyle=":",
+    linewidth=1.4,
+    label="Conventional 0.50",
+)
+ax.axvline(
+    maximum_f1_threshold,
+    color="#222222",
+    linestyle="--",
+    linewidth=1.4,
+    label=f"Maximum F1 ({maximum_f1_threshold:.2f})",
+)
+ax.set_xlabel("Probability threshold")
+ax.set_ylabel("Metric value")
+ax.set_ylim(0, 1.02)
+ax.set_title("Classification trade-offs depend on the decision threshold")
+ax.legend(ncol=2)
+plt.tight_layout()
+plt.show()
+plt.close(fig)
+```
+
+## Phase 12 interpretation checkpoint
+
+The aggregated out-of-fold predictions reproduce development prevalence closely: both
+the observed attrition rate and mean predicted probability are 16.2%. Discrimination
+and probability quality are consistent with the fold-level results, with Average
+Precision 0.640, ROC-AUC 0.835, Brier score 0.092, and log loss 0.324.
+
+The recalibration intercept is -0.096 and the slope is 0.920. These are reasonably near
+their ideal values of 0 and 1, but the slope below 1 suggests mildly over-dispersed
+probabilities: high estimates tend to be somewhat too high and low estimates somewhat
+too low. This departure is modest, so no recalibration step is added before independent
+test evaluation. The mean within-employee standard deviation across five repeated
+out-of-fold predictions is 0.023, indicating that probabilities are generally stable
+to the resampled training composition; this is not an individual uncertainty interval.
+
+The conventional 0.50 threshold flags only 9.0% of development employees. It provides
+76.4% precision and 97.5% specificity, but recall is only 42.6%: 109 of 190 observed
+attrition cases are missed. This illustrates why 0.50 is not automatically an
+appropriate decision threshold for an imbalanced outcome.
+
+The maximum-F1 threshold is 0.32. It flags 16.4% of employees and yields 58.5%
+precision, 59.5% recall, and 91.9% specificity. Requiring at least 70% recall lowers
+the threshold to 0.23, flags 25.7% of employees, and reduces precision to 44.4%. An
+illustrative 20% review capacity corresponds to a threshold of approximately 0.275,
+with 50.8% precision, 63.2% recall, and 88.2% specificity.
+
+No threshold will be treated as operational without an explicit intervention, review
+capacity, and relative cost for false positives and false negatives. In this portfolio,
+threshold-dependent metrics demonstrate decision consequences rather than authorize
+automated employment decisions.
+
+## 19. Final held-out test evaluation
+
+All modeling decisions are now frozen:
+
+- predictor set: combined behavioral and contextual variables;
+- model: L2-regularized logistic regression;
+- regularization: `C = 1`;
+- primary metric: Average Precision;
+- secondary metrics: ROC-AUC, Brier score, and log loss;
+- descriptive reporting threshold: `0.32`, selected by maximum development F1.
+
+The threshold is not an operational HR recommendation. It is frozen only to demonstrate
+how a development-selected classification rule transfers to new observations. The test
+set is opened once below; its results will not trigger model or threshold revision.
+
+### 19.1 Freeze the reporting rule and fit on all development data
+
+```{python}
+REPORTING_THRESHOLD = 0.32
+TEST_BOOTSTRAP_SAMPLES = 2_000
+
+if not np.isclose(REPORTING_THRESHOLD, maximum_f1_threshold):
+    raise ValueError(
+        "The reporting threshold does not match the development-selected value."
+    )
+
+final_logistic_pipeline = clone(selected_combined_pipeline)
+final_logistic_pipeline.fit(
+    development_df[COMBINED_PREDICTORS],
+    development_y,
+)
+
+test_y = test_df["AttritionBinary"].to_numpy()
+test_probabilities = final_logistic_pipeline.predict_proba(
+    test_df[COMBINED_PREDICTORS]
+)[:, 1]
+
+test_predictions = pd.DataFrame(
+    {
+        "EmployeeNumber": test_employee_ids.to_numpy(),
+        "observed_attrition": test_y,
+        "predicted_probability": test_probabilities,
+        "predicted_at_reporting_threshold": (
+            test_probabilities >= REPORTING_THRESHOLD
+        ).astype(int),
+    }
+)
+
+if len(test_predictions) != len(test_df):
+    raise ValueError("Test predictions do not cover the held-out test sample.")
+
+if not test_predictions["EmployeeNumber"].is_unique:
+    raise ValueError("Test prediction identifiers are not unique.")
+
+if not np.isfinite(test_probabilities).all():
+    raise ValueError("Final model produced non-finite test probabilities.")
+
+print(
+    f"Final model fitted on {len(development_df)} development employees and "
+    f"evaluated once on {len(test_df)} held-out employees."
+)
+```
+
+Identifiers remain partition and audit keys only; `EmployeeNumber` was not supplied to
+the model.
+
+### 19.2 Calculate final metrics with bootstrap uncertainty
+
+The percentile bootstrap repeatedly resamples held-out employees with replacement and
+recalculates every metric. It quantifies sampling uncertainty within this test set; it
+does not address dataset realism, temporal drift, or transportability to another
+organization.
+
+```{python}
+test_threshold_metrics = calculate_threshold_metrics(
+    test_y,
+    test_probabilities,
+    REPORTING_THRESHOLD,
+)
+
+test_point_estimates = {
+    "Observed attrition rate": test_y.mean(),
+    "Mean predicted probability": test_probabilities.mean(),
+    "Average Precision": average_precision_score(test_y, test_probabilities),
+    "ROC-AUC": roc_auc_score(test_y, test_probabilities),
+    "Brier score": brier_score_loss(test_y, test_probabilities),
+    "Log loss": log_loss(test_y, test_probabilities, labels=[0, 1]),
+    "Precision at 0.32": test_threshold_metrics["precision"],
+    "Recall at 0.32": test_threshold_metrics["recall"],
+    "Specificity at 0.32": test_threshold_metrics["specificity"],
+    "F1 at 0.32": test_threshold_metrics["f1"],
+    "Balanced accuracy at 0.32": test_threshold_metrics["balanced_accuracy"],
+    "Flagged percentage at 0.32": (
+        test_threshold_metrics["flagged_percentage"] / 100
+    ),
+}
+
+test_bootstrap_rng = np.random.default_rng(RANDOM_SEED + 19)
+test_bootstrap_rows = []
+
+while len(test_bootstrap_rows) < TEST_BOOTSTRAP_SAMPLES:
+    bootstrap_positions = test_bootstrap_rng.integers(
+        0,
+        len(test_y),
+        size=len(test_y),
+    )
+    bootstrap_y = test_y[bootstrap_positions]
+    bootstrap_probabilities = test_probabilities[bootstrap_positions]
+
+    if np.unique(bootstrap_y).size < 2:
+        continue
+
+    bootstrap_threshold = calculate_threshold_metrics(
+        bootstrap_y,
+        bootstrap_probabilities,
+        REPORTING_THRESHOLD,
+    )
+    test_bootstrap_rows.append(
+        {
+            "Observed attrition rate": bootstrap_y.mean(),
+            "Mean predicted probability": bootstrap_probabilities.mean(),
+            "Average Precision": average_precision_score(
+                bootstrap_y, bootstrap_probabilities
+            ),
+            "ROC-AUC": roc_auc_score(
+                bootstrap_y, bootstrap_probabilities
+            ),
+            "Brier score": brier_score_loss(
+                bootstrap_y, bootstrap_probabilities
+            ),
+            "Log loss": log_loss(
+                bootstrap_y, bootstrap_probabilities,
+                labels=[0, 1],
+            ),
+            "Precision at 0.32": bootstrap_threshold["precision"],
+            "Recall at 0.32": bootstrap_threshold["recall"],
+            "Specificity at 0.32": bootstrap_threshold["specificity"],
+            "F1 at 0.32": bootstrap_threshold["f1"],
+            "Balanced accuracy at 0.32": bootstrap_threshold[
+                "balanced_accuracy"
+            ],
+            "Flagged percentage at 0.32": (
+                bootstrap_threshold["flagged_percentage"] / 100
+            ),
+        }
+    )
+
+test_bootstrap_results = pd.DataFrame(test_bootstrap_rows)
+
+final_test_performance = pd.DataFrame(
+    [
+        {
+            "metric": metric,
+            "estimate": estimate,
+            "ci_95_low": test_bootstrap_results[metric].quantile(0.025),
+            "ci_95_high": test_bootstrap_results[metric].quantile(0.975),
+        }
+        for metric, estimate in test_point_estimates.items()
+    ]
+)
+
+display(final_test_performance)
+```
+
+Bootstrap intervals may be asymmetric, particularly for Average Precision and
+threshold metrics, because the test set contains only 47 observed attrition cases.
+
+### 19.3 Compare development and held-out performance
+
+The development values below come from aggregated repeated out-of-fold probabilities,
+not in-sample fitted probabilities. A moderate test difference is expected; a large
+drop across several metrics would indicate poorer generalization than cross-validation
+suggested.
+
+```{python}
+development_probability_metrics = {
+    "Average Precision": average_precision_score(
+        oof_observed, oof_probabilities
+    ),
+    "ROC-AUC": roc_auc_score(oof_observed, oof_probabilities),
+    "Brier score": brier_score_loss(oof_observed, oof_probabilities),
+    "Log loss": log_loss(oof_observed, oof_probabilities, labels=[0, 1]),
+}
+
+test_probability_metrics = {
+    "Average Precision": average_precision_score(test_y, test_probabilities),
+    "ROC-AUC": roc_auc_score(test_y, test_probabilities),
+    "Brier score": brier_score_loss(test_y, test_probabilities),
+    "Log loss": log_loss(test_y, test_probabilities, labels=[0, 1]),
+}
+
+generalization_comparison = pd.DataFrame(
+    [
+        {
+            "metric": metric,
+            "development_oof": development_probability_metrics[metric],
+            "held_out_test": test_probability_metrics[metric],
+            "test_minus_development": (
+                test_probability_metrics[metric]
+                - development_probability_metrics[metric]
+            ),
+            "preferred_direction": (
+                "Higher" if METRIC_DIRECTIONS[
+                    {
+                        "Average Precision": "average_precision",
+                        "ROC-AUC": "roc_auc",
+                        "Brier score": "brier_score",
+                        "Log loss": "log_loss",
+                    }[metric]
+                ] == "higher" else "Lower"
+            ),
+        }
+        for metric in development_probability_metrics
+    ]
+)
+
+display(generalization_comparison)
+```
+
+### 19.4 Report the frozen-threshold confusion matrix
+
+```{python}
+test_threshold_summary = pd.DataFrame(
+    [
+        {
+            "reporting_threshold": REPORTING_THRESHOLD,
+            **{
+                key: value
+                for key, value in test_threshold_metrics.items()
+                if key != "threshold"
+            },
+        }
+    ]
+)
+
+display(test_threshold_summary)
+
+test_confusion_matrix = np.array(
+    [
+        [
+            test_threshold_metrics["true_negative"],
+            test_threshold_metrics["false_positive"],
+        ],
+        [
+            test_threshold_metrics["false_negative"],
+            test_threshold_metrics["true_positive"],
+        ],
+    ]
+)
+
+fig, ax = plt.subplots(figsize=(6.5, 5))
+sns.heatmap(
+    test_confusion_matrix,
+    annot=True,
+    fmt="d",
+    cmap="Blues",
+    cbar=False,
+    xticklabels=["Predicted stayed", "Flagged"],
+    yticklabels=["Observed stayed", "Observed left"],
+    ax=ax,
+)
+ax.set_title("Held-out confusion matrix at frozen threshold 0.32")
+ax.set_xlabel("")
+ax.set_ylabel("")
+plt.tight_layout()
+plt.show()
+plt.close(fig)
+```
+
+### 19.5 Visualize final discrimination
+
+Precision-recall is primary because attrition is the minority class. The ROC curve is
+included as a secondary ranking view.
+
+```{python}
+from sklearn.metrics import precision_recall_curve, roc_curve
+
+test_precision_curve, test_recall_curve, _ = precision_recall_curve(
+    test_y,
+    test_probabilities,
+)
+test_false_positive_rate, test_true_positive_rate, _ = roc_curve(
+    test_y,
+    test_probabilities,
+)
+
+fig, axes = plt.subplots(1, 2, figsize=(12.5, 5))
+
+axes[0].plot(
+    test_recall_curve,
+    test_precision_curve,
+    color=ATTRITION_COLOR,
+    linewidth=2,
+    label=(
+        "Combined logistic "
+        f"(AP={test_probability_metrics['Average Precision']:.3f})"
+    ),
+)
+axes[0].axhline(
+    test_y.mean(),
+    color="#566573",
+    linestyle="--",
+    label=f"Test prevalence ({test_y.mean():.3f})",
+)
+axes[0].set_xlim(0, 1)
+axes[0].set_ylim(0, 1.02)
+axes[0].set_xlabel("Recall")
+axes[0].set_ylabel("Precision")
+axes[0].set_title("Held-out precision-recall curve")
+axes[0].legend(loc="upper right")
+
+axes[1].plot(
+    test_false_positive_rate,
+    test_true_positive_rate,
+    color=RETENTION_COLOR,
+    linewidth=2,
+    label=(
+        "Combined logistic "
+        f"(AUC={test_probability_metrics['ROC-AUC']:.3f})"
+    ),
+)
+axes[1].plot(
+    [0, 1],
+    [0, 1],
+    color="#566573",
+    linestyle="--",
+    label="Chance ranking",
+)
+axes[1].set_xlim(0, 1)
+axes[1].set_ylim(0, 1.02)
+axes[1].set_xlabel("False-positive rate")
+axes[1].set_ylabel("True-positive rate")
+axes[1].set_title("Held-out ROC curve")
+axes[1].legend(loc="lower right")
+
+fig.suptitle("Final held-out discrimination of the frozen logistic model")
+plt.tight_layout()
+plt.show()
+plt.close(fig)
+```
+
+### 19.6 Inspect held-out calibration in five broad groups
+
+Five quantile groups are used instead of ten because the test set contains only 47
+attrition cases. This plot is a coarse diagnostic, not enough evidence to fit a new
+calibration model.
+
+```{python}
+test_calibration_source = test_predictions.copy()
+test_calibration_source["probability_group"] = pd.qcut(
+    test_calibration_source["predicted_probability"],
+    q=5,
+    duplicates="drop",
+)
+
+test_calibration_groups = (
+    test_calibration_source.groupby("probability_group", observed=True)
+    .agg(
+        employees=("observed_attrition", "size"),
+        attrition_cases=("observed_attrition", "sum"),
+        mean_predicted_probability=("predicted_probability", "mean"),
+        observed_attrition_rate=("observed_attrition", "mean"),
+    )
+    .reset_index(drop=True)
+)
+test_calibration_groups.insert(
+    0,
+    "group",
+    np.arange(1, len(test_calibration_groups) + 1),
+)
+
+display(test_calibration_groups)
+
+test_calibration_maximum = max(
+    test_calibration_groups["mean_predicted_probability"].max(),
+    test_calibration_groups["observed_attrition_rate"].max(),
+) * 1.10
+
+fig, ax = plt.subplots(figsize=(6.5, 5.5))
+ax.plot(
+    [0, test_calibration_maximum],
+    [0, test_calibration_maximum],
+    color="#222222",
+    linestyle="--",
+    label="Perfect calibration",
+)
+ax.plot(
+    test_calibration_groups["mean_predicted_probability"],
+    test_calibration_groups["observed_attrition_rate"],
+    marker="o",
+    linewidth=2,
+    color=RETENTION_COLOR,
+    label="Held-out groups",
+)
+for _, row in test_calibration_groups.iterrows():
+    ax.annotate(
+        f"n={int(row['employees'])}, left={int(row['attrition_cases'])}",
+        (
+            row["mean_predicted_probability"],
+            row["observed_attrition_rate"],
+        ),
+        xytext=(5, 5),
+        textcoords="offset points",
+        fontsize=8,
+    )
+ax.set_xlim(0, test_calibration_maximum)
+ax.set_ylim(0, test_calibration_maximum)
+ax.set_xlabel("Mean held-out predicted probability")
+ax.set_ylabel("Observed held-out attrition rate")
+ax.set_title("Held-out calibration in probability quintiles")
+ax.legend(loc="upper left")
+plt.tight_layout()
+plt.show()
+plt.close(fig)
+```
+
+## Phase 13 interpretation checkpoint
+
+The frozen model reaches held-out Average Precision 0.583 (95% bootstrap interval:
+0.444 to 0.712) against test prevalence 0.160. ROC-AUC is 0.799 (0.717 to 0.870),
+Brier score is 0.099 (0.075 to 0.125), and log loss is 0.351 (0.270 to 0.447). Mean
+predicted probability is 0.150 compared with 0.160 observed attrition, indicating
+reasonable overall probability level on the held-out sample.
+
+Performance is moderately weaker than repeated out-of-fold development results:
+Average Precision decreases by 0.057 and ROC-AUC by 0.036, while Brier score increases
+by 0.007 and log loss by 0.027. This is a plausible generalization gap rather than a
+catastrophic failure. The bootstrap intervals are necessarily broad because only 47
+attrition cases occur in the 294-employee test set; the point estimates should not be
+presented as precise population constants.
+
+At the frozen descriptive threshold of 0.32, the model flags 45 employees (15.3%). It
+identifies 26 of 47 observed attrition cases and produces 19 false-positive flags,
+giving precision 0.578 (0.431 to 0.723), recall 0.553 (0.410 to 0.696), specificity
+0.923 (0.888 to 0.955), and F1 0.565 (0.432 to 0.685). These values transfer reasonably
+from development, where precision was 0.585 and recall 0.595, but they remain a
+descriptive demonstration rather than an operational intervention rule.
+
+Held-out probability quintiles show useful risk concentration: the highest quintile
+contains 28 of the 47 attrition cases, with mean predicted probability 0.482 and
+observed rate 0.475. Lower and middle groups fluctuate around the calibration diagonal;
+for example, the third group has eight cases among 58 employees despite mean predicted
+probability 0.071. With small group-specific case counts, these deviations are too
+uncertain to justify post-hoc recalibration.
+
+The test set is now consumed. No predictor, preprocessing rule, regularization value,
+model family, calibration method, or reporting threshold will be changed in response
+to these results. The synthetic, cross-sectional dataset remains the principal
+external-validity limitation despite promising held-out discrimination.
+
+## 20. Sensitive-attribute performance audit
+
+Age, gender, and marital status were excluded from model fitting but can still reveal
+heterogeneous performance because included predictors may act as proxies or because
+the underlying associations differ across groups. We attach these attributes only
+after probabilities have been generated and audit:
+
+- observed prevalence and mean predicted probability;
+- calibration gap (`mean predicted - observed`);
+- Average Precision, ROC-AUC, and Brier score;
+- flag rate, precision, recall, specificity, and false-positive rate at 0.32.
+
+This is a diagnostic audit, not proof of fairness or discrimination. Metrics based on
+few attrition cases are unstable, and Average Precision depends on subgroup prevalence.
+
+### 20.1 Attach audit attributes to frozen predictions
+
+```{python}
+sensitive_attribute_lookup = sensitive_audit_df[
+    ["AgeBand", "Gender", "MaritalStatus"]
+].copy()
+sensitive_attribute_lookup.insert(
+    0,
+    "EmployeeNumber",
+    raw_df["EmployeeNumber"],
+)
+sensitive_attribute_lookup.insert(
+    0,
+    "row_index",
+    sensitive_attribute_lookup.index,
+)
+
+development_subgroup_predictions = development_oof_predictions.merge(
+    sensitive_attribute_lookup[
+        ["row_index", "AgeBand", "Gender", "MaritalStatus"]
+    ],
+    on="row_index",
+    how="left",
+    validate="one_to_one",
+)
+
+test_subgroup_predictions = test_predictions.merge(
+    sensitive_attribute_lookup[
+        ["EmployeeNumber", "AgeBand", "Gender", "MaritalStatus"]
+    ],
+    on="EmployeeNumber",
+    how="left",
+    validate="one_to_one",
+)
+
+for partition_name, audit_frame, expected_size in [
+    ("Development OOF", development_subgroup_predictions, len(development_df)),
+    ("Held-out test", test_subgroup_predictions, len(test_df)),
+]:
+    if len(audit_frame) != expected_size:
+        raise ValueError(f"{partition_name} audit merge changed the row count.")
+    if audit_frame[["AgeBand", "Gender", "MaritalStatus"]].isna().any().any():
+        raise ValueError(f"{partition_name} has missing audit attributes.")
+
+if set(SENSITIVE_AUDIT_VARIABLES) & set(COMBINED_PREDICTORS):
+    raise ValueError("A sensitive audit attribute appears in the final predictors.")
+
+print("Audit attributes attached after prediction; none entered model fitting.")
+```
+
+### 20.2 Calculate subgroup performance
+
+The reliability label is intentionally conservative. `Very limited` indicates fewer
+than 50 employees or fewer than five positive or negative cases. `Limited` indicates
+fewer than 20 cases from either outcome class. It is a warning about estimation
+stability, not a judgment about the subgroup.
+
+```{python}
+AUDIT_ATTRIBUTES = ["AgeBand", "Gender", "MaritalStatus"]
+
+
+def summarize_subgroup_performance(audit_frame, attribute, partition):
+    rows = []
+    for subgroup, subgroup_frame in audit_frame.groupby(attribute, observed=True):
+        observed = subgroup_frame["observed_attrition"].to_numpy()
+        probabilities = subgroup_frame["predicted_probability"].to_numpy()
+        threshold_metrics = calculate_threshold_metrics(
+            observed,
+            probabilities,
+            REPORTING_THRESHOLD,
+        )
+        positive_cases = int(observed.sum())
+        negative_cases = int(len(observed) - positive_cases)
+
+        if len(observed) < 50 or min(positive_cases, negative_cases) < 5:
+            reliability = "Very limited"
+        elif min(positive_cases, negative_cases) < 20:
+            reliability = "Limited"
+        else:
+            reliability = "More stable"
+
+        has_both_classes = np.unique(observed).size == 2
+        rows.append(
+            {
+                "partition": partition,
+                "attribute": attribute,
+                "subgroup": str(subgroup),
+                "employees": len(observed),
+                "attrition_cases": positive_cases,
+                "observed_attrition_rate": observed.mean(),
+                "mean_predicted_probability": probabilities.mean(),
+                "calibration_gap_predicted_minus_observed": (
+                    probabilities.mean() - observed.mean()
+                ),
+                "average_precision": (
+                    average_precision_score(observed, probabilities)
+                    if has_both_classes else np.nan
+                ),
+                "roc_auc": (
+                    roc_auc_score(observed, probabilities)
+                    if has_both_classes else np.nan
+                ),
+                "brier_score": brier_score_loss(observed, probabilities),
+                "flagged_percentage": threshold_metrics["flagged_percentage"],
+                "precision": threshold_metrics["precision"],
+                "recall": threshold_metrics["recall"],
+                "specificity": threshold_metrics["specificity"],
+                "false_positive_rate": 1 - threshold_metrics["specificity"],
+                "reliability": reliability,
+            }
+        )
+    return rows
+
+
+subgroup_audit_rows = []
+for attribute in AUDIT_ATTRIBUTES:
+    subgroup_audit_rows.extend(
+        summarize_subgroup_performance(
+            development_subgroup_predictions,
+            attribute,
+            "Development OOF",
+        )
+    )
+    subgroup_audit_rows.extend(
+        summarize_subgroup_performance(
+            test_subgroup_predictions,
+            attribute,
+            "Held-out test",
+        )
+    )
+
+subgroup_audit_summary = pd.DataFrame(subgroup_audit_rows)
+
+display(
+    subgroup_audit_summary.loc[
+        subgroup_audit_summary["partition"] == "Development OOF"
+    ].reset_index(drop=True)
+)
+display(
+    subgroup_audit_summary.loc[
+        subgroup_audit_summary["partition"] == "Held-out test"
+    ].reset_index(drop=True)
+)
+```
+
+### 20.3 Summarize within-attribute metric ranges
+
+Ranges highlight where subgroup metrics differ most, but they do not adjust for
+sampling uncertainty or establish a legal fairness criterion. Large ranges driven by a
+`Very limited` group require more data rather than a strong conclusion.
+
+```{python}
+subgroup_gap_summary = (
+    subgroup_audit_summary.groupby(["partition", "attribute"], as_index=False)
+    .agg(
+        minimum_group_employees=("employees", "min"),
+        minimum_group_attrition_cases=("attrition_cases", "min"),
+        calibration_gap_range=(
+            "calibration_gap_predicted_minus_observed",
+            lambda values: values.max() - values.min(),
+        ),
+        roc_auc_range=("roc_auc", lambda values: values.max() - values.min()),
+        recall_range=("recall", lambda values: values.max() - values.min()),
+        false_positive_rate_range=(
+            "false_positive_rate",
+            lambda values: values.max() - values.min(),
+        ),
+        very_limited_groups=(
+            "reliability",
+            lambda values: int((values == "Very limited").sum()),
+        ),
+    )
+)
+
+display(subgroup_gap_summary)
+```
+
+### 20.4 Visualize held-out subgroup calibration
+
+Observed rates and mean predictions are shown together. Labels report subgroup sample
+size and attrition cases, which are essential for interpreting apparent gaps.
+
+```{python}
+held_out_subgroup_audit = subgroup_audit_summary.loc[
+    subgroup_audit_summary["partition"] == "Held-out test"
+].copy()
+
+fig, axes = plt.subplots(1, 3, figsize=(17, 5.5))
+
+for ax, attribute in zip(axes, AUDIT_ATTRIBUTES):
+    attribute_data = held_out_subgroup_audit.loc[
+        held_out_subgroup_audit["attribute"] == attribute
+    ].reset_index(drop=True)
+    x_positions = np.arange(len(attribute_data))
+
+    ax.plot(
+        x_positions,
+        attribute_data["observed_attrition_rate"],
+        marker="o",
+        linewidth=2,
+        color=ATTRITION_COLOR,
+        label="Observed rate",
+    )
+    ax.plot(
+        x_positions,
+        attribute_data["mean_predicted_probability"],
+        marker="o",
+        linewidth=2,
+        color=RETENTION_COLOR,
+        label="Mean predicted",
+    )
+    for row_position, row in attribute_data.iterrows():
+        ax.annotate(
+            f"n={int(row['employees'])}, left={int(row['attrition_cases'])}",
+            (
+                row_position,
+                max(
+                    row["observed_attrition_rate"],
+                    row["mean_predicted_probability"],
+                ),
+            ),
+            xytext=(0, 8),
+            textcoords="offset points",
+            ha="center",
+            fontsize=8,
+        )
+    ax.set_xticks(x_positions, attribute_data["subgroup"], rotation=25)
+    ax.set_ylim(0, max(0.55, attribute_data["observed_attrition_rate"].max() * 1.25))
+    ax.set_title(attribute.replace("Band", " band"))
+    ax.set_xlabel("")
+
+axes[0].set_ylabel("Probability / observed attrition rate")
+axes[-1].legend(loc="upper right")
+fig.suptitle(
+    "Held-out subgroup calibration audit with explicit sample sizes",
+    fontsize=15,
+)
+plt.tight_layout()
+plt.show()
+plt.close(fig)
+```
+
+## Phase 14 interpretation checkpoint
+
+Sensitive attributes enter only after predictions are frozen; none is a model
+predictor. Gender metrics are relatively similar in development OOF data: calibration
+gaps differ by 0.026, ROC-AUC by 0.008, recall by 0.085, and false-positive rate by
+0.010. In the smaller test sample, female and male Average Precision is nearly equal
+(0.596 and 0.594), while ROC-AUC is 0.756 and 0.830. Female recall is higher (0.625
+versus 0.516) but so is false-positive rate (0.110 versus 0.054). The female subgroup
+contains only 16 test attrition cases, so these differences require replication rather
+than a definitive fairness claim.
+
+Age shows the largest instability. Development OOF ranges are 0.156 for calibration
+gap, 0.240 for ROC-AUC, and 0.542 for recall. Test ranges are also large, but three of
+five age bands are labeled `Very limited`. The 55+ group is underpredicted by 0.173 and
+the 45-54 group has recall 0.167; however, these estimates are based on only 13
+employees with three cases and 40 employees with six cases, respectively. They identify
+a validation priority, not reliable evidence of systematic model behavior.
+
+Marital-status differences are moderate in development and less stable in test. The
+single group has the highest test prevalence (0.258), a mean prediction of 0.223,
+recall 0.600, and false-positive rate 0.153. Married employees have recall 0.444 and
+false-positive rate 0.052. The divorced subgroup appears to perform strongly, but it
+contains only four test attrition cases and is therefore `Very limited`; its metrics
+must not be promoted as comparative evidence.
+
+Overall assessment: the audit is suitable to share with explicit caveats for a
+synthetic portfolio analysis, but it is not deployment-ready fairness evidence. Age
+bands require substantially more positive cases, and all subgroup metrics would need
+validation on temporally distinct, organization-specific data. Differences in base
+rates also mean that equal precision, equal recall, and equal flag rates generally
+cannot all be achieved simultaneously with one threshold.
+
+## Limitations, uncertainty, and robustness
+
+The analysis has several boundaries that materially affect interpretation:
+
+- **Synthetic and cross-sectional source.** The rows do not establish how a model
+  transports across organizations or future time periods. A random holdout measures
+  internal generalization, not temporal or external validity.
+- **No causal identification.** Overtime, travel, satisfaction, tenure, income, and
+  attrition may share unobserved causes. Conditional coefficients and SHAP-style model
+  explanations cannot identify intervention effects.
+- **Single-item attitude indicators.** Satisfaction and involvement variables are
+  four-level items, not validated multi-item psychological scales. Treating them as
+  ordered numeric predictors imposes a linear log-odds trend in the logistic model.
+- **Correlated career indicators.** Tenure, role, manager, level, and income share
+  information. L2 regularization stabilizes prediction but does not make individual
+  coefficients independent effects. The sign reversal for years since last promotion
+  is documented as possible suppression rather than a causal finding.
+- **Finite test uncertainty.** The test contains 294 employees and 47 attrition cases.
+  Bootstrap intervals are correspondingly broad, especially for Average Precision and
+  threshold metrics.
+- **Subgroup sparsity.** Three of five held-out age bands and the divorced subgroup have
+  very limited positive counts. The audit identifies validation priorities but cannot
+  support a legal or deployment fairness determination.
+- **Threshold assumptions.** The value 0.32 maximizes development F1 and is retained
+  only for descriptive transfer. No intervention capacity, benefit, or asymmetric
+  error cost was supplied, so it is not an operational decision rule.
+- **Multiple descriptive comparisons.** Bivariate intervals describe selected effect
+  sizes but are not adjusted to support confirmatory claims across every inspected
+  variable and category.
+
+Robustness checks include Wilson and bootstrap intervals, repeated stratified
+cross-validation, paired fold comparisons, coefficient stability across 25 fits,
+nested XGBoost tuning, repeated out-of-fold calibration, a single held-out evaluation,
+and explicit subgroup reliability labels. None resolves the external-validity limits
+of synthetic data.
+
+## Recommended next steps
+
+1. Validate the frozen specification on temporally later, organization-specific data
+   before considering any practical use.
+2. Replace single attitude items with psychometrically evaluated multi-item measures
+   when the goal is quantitative psychological inference.
+3. Define a supportive intervention, review capacity, and the relative consequences of
+   false positives and false negatives before selecting an operational threshold.
+4. Collect substantially more outcome cases within age and marital-status groups and
+   prespecify the fairness criteria appropriate to the intended use.
+5. If deployed only after those steps, monitor prevalence, calibration, data drift,
+   subgroup performance, and intervention outcomes rather than only classification
+   accuracy.
+
+## Further questions
+
+- Does the behavioral block retain incremental value under a temporal rather than
+  random split?
+- Are attitude-item associations stable after measurement error and construct validity
+  are modeled explicitly?
+- Which included contextual variables act as proxies for excluded sensitive attributes?
+- Would a defined, low-risk support intervention improve employee outcomes, and can
+  that effect be evaluated experimentally without punitive use?
+
+## Reproducibility and handoff
+
+The report is generated from `analysis/people_analytics_attrition.qmd` using the source
+file `data/raw/HR-Employee-Attrition.csv`. Project-root discovery makes execution
+independent of the current working directory. All stochastic operations use seed 42,
+preprocessing is fitted inside training folds, employee identifiers are used only for
+partition and audit integrity, and the test set is evaluated once after all decisions
+are frozen.
+
+The 77 Python cells have been executed successfully from a clean session. To reproduce
+the HTML report from the repository root:
+
+```powershell
+quarto render analysis/people_analytics_attrition.qmd
+```
+
+Package requirements are listed in `requirements.txt`. Exact environment locking,
+application reconciliation, automated tests, and repository-level documentation are
+the next project-engineering tasks before publication.

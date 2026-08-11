@@ -1,162 +1,110 @@
-"""
-preprocessing.py
-----------------
-Data loading, cleaning, and feature engineering pipeline.
-Extracted from 01_exploratory_analysis.ipynb — Phase 1.
+"""Data loading and validation for the attrition analysis."""
 
-Author: Washington Casamen Nolasco
-"""
+from pathlib import Path
 
 import pandas as pd
-import numpy as np
 
 
-def load_data(filepath: str) -> pd.DataFrame:
-    """
-    Load raw IBM HR Analytics dataset and apply initial cleaning.
+TARGET_COLUMN = "Attrition"
+TARGET_BINARY_COLUMN = "AttritionBinary"
+IDENTIFIER_COLUMN = "EmployeeNumber"
 
-    Removes three constant columns with no analytical value:
-    - EmployeeCount: always 1
-    - Over18: always 'Y'
-    - StandardHours: always 80
+EXPECTED_COLUMNS = [
+    "Age",
+    "Attrition",
+    "BusinessTravel",
+    "DailyRate",
+    "Department",
+    "DistanceFromHome",
+    "Education",
+    "EducationField",
+    "EmployeeCount",
+    "EmployeeNumber",
+    "EnvironmentSatisfaction",
+    "Gender",
+    "HourlyRate",
+    "JobInvolvement",
+    "JobLevel",
+    "JobRole",
+    "JobSatisfaction",
+    "MaritalStatus",
+    "MonthlyIncome",
+    "MonthlyRate",
+    "NumCompaniesWorked",
+    "Over18",
+    "OverTime",
+    "PercentSalaryHike",
+    "PerformanceRating",
+    "RelationshipSatisfaction",
+    "StandardHours",
+    "StockOptionLevel",
+    "TotalWorkingYears",
+    "TrainingTimesLastYear",
+    "WorkLifeBalance",
+    "YearsAtCompany",
+    "YearsInCurrentRole",
+    "YearsSinceLastPromotion",
+    "YearsWithCurrManager",
+]
 
-    Parameters
-    ----------
-    filepath : str
-        Path to HR-Employee-Attrition.csv
+CONSTANT_COLUMNS = ["EmployeeCount", "Over18", "StandardHours"]
+AMBIGUOUS_RATE_COLUMNS = ["DailyRate", "HourlyRate", "MonthlyRate"]
+SENSITIVE_AUDIT_COLUMNS = ["Age", "Gender", "MaritalStatus"]
 
-    Returns
-    -------
-    pd.DataFrame
-        Cleaned dataframe with 32 variables.
-    """
-    df = pd.read_csv(filepath)
-    df.drop(columns=['EmployeeCount', 'Over18', 'StandardHours'], inplace=True)
-    return df
-
-
-def encode_target(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Binary encode the Attrition target variable.
-
-    Yes -> 1 (left)
-    No  -> 0 (stayed)
-
-    Parameters
-    ----------
-    df : pd.DataFrame
-
-    Returns
-    -------
-    pd.DataFrame
-        Dataframe with added AttritionBinary column.
-    """
-    df = df.copy()
-    df['AttritionBinary'] = (df['Attrition'] == 'Yes').astype(int)
-    return df
-
-
-def encode_overtime(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Binary encode the OverTime variable for clustering.
-
-    Yes -> 1
-    No  -> 0
-
-    Parameters
-    ----------
-    df : pd.DataFrame
-
-    Returns
-    -------
-    pd.DataFrame
-        Dataframe with added OverTimeBinary column.
-    """
-    df = df.copy()
-    df['OverTimeBinary'] = (df['OverTime'] == 'Yes').astype(int)
-    return df
+AGE_BINS = [18, 25, 35, 45, 55, float("inf")]
+AGE_BAND_LABELS = ["18-24", "25-34", "35-44", "45-54", "55+"]
 
 
-def encode_categoricals(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    One-hot encode all categorical variables for modeling.
-    Uses drop_first=True to avoid multicollinearity.
+def validate_source_data(data: pd.DataFrame) -> None:
+    """Raise a clear error when the source no longer matches the analysis contract."""
+    missing_columns = sorted(set(EXPECTED_COLUMNS) - set(data.columns))
+    unexpected_columns = sorted(set(data.columns) - set(EXPECTED_COLUMNS))
+    if missing_columns or unexpected_columns:
+        raise ValueError(
+            "Unexpected source schema. "
+            f"Missing columns: {missing_columns}; "
+            f"unexpected columns: {unexpected_columns}."
+        )
 
-    Parameters
-    ----------
-    df : pd.DataFrame
-        Must contain AttritionBinary column.
+    if set(data[TARGET_COLUMN].dropna().unique()) != {"No", "Yes"}:
+        raise ValueError("Attrition must contain exactly the levels 'No' and 'Yes'.")
+    if not data[IDENTIFIER_COLUMN].is_unique:
+        raise ValueError("EmployeeNumber must uniquely identify every source row.")
+    if data.isna().any().any():
+        raise ValueError("The frozen analysis expects a source with no missing cells.")
 
-    Returns
-    -------
-    pd.DataFrame
-        Fully numeric dataframe ready for ML pipeline.
-    """
-    df_encoded = pd.get_dummies(
-        df.drop(columns=['Attrition']),
-        drop_first=True
+    detected_constants = data.columns[data.nunique(dropna=False).eq(1)].tolist()
+    if set(detected_constants) != set(CONSTANT_COLUMNS):
+        raise ValueError(
+            "Detected constant columns differ from the frozen specification: "
+            f"{detected_constants}."
+        )
+
+
+def load_data(filepath: str | Path) -> pd.DataFrame:
+    """Load, validate, and return a copy of the raw IBM synthetic dataset."""
+    data_path = Path(filepath)
+    if not data_path.is_file():
+        raise FileNotFoundError(f"Expected data file was not found: {data_path}")
+
+    data = pd.read_csv(data_path)
+    validate_source_data(data)
+    return data
+
+
+def add_analysis_fields(data: pd.DataFrame) -> pd.DataFrame:
+    """Add the encoded target and audit-only age bands without dropping source fields."""
+    analysis_data = data.copy()
+    analysis_data[TARGET_BINARY_COLUMN] = (
+        analysis_data[TARGET_COLUMN] == "Yes"
+    ).astype(int)
+    analysis_data["AgeBand"] = pd.cut(
+        analysis_data["Age"],
+        bins=AGE_BINS,
+        labels=AGE_BAND_LABELS,
+        right=False,
+        include_lowest=True,
     )
-    return df_encoded
-
-
-def get_class_imbalance_ratio(y: pd.Series) -> float:
-    """
-    Compute class imbalance ratio for XGBoost scale_pos_weight.
-
-    ratio = count(negative class) / count(positive class)
-
-    Parameters
-    ----------
-    y : pd.Series
-        Binary target variable (0/1).
-
-    Returns
-    -------
-    float
-        Recommended scale_pos_weight value.
-    """
-    return (y == 0).sum() / (y == 1).sum()
-
-
-def variable_taxonomy() -> dict:
-    """
-    Return the conceptual taxonomy of dataset variables.
-    Used for documentation and analytical framing.
-
-    Returns
-    -------
-    dict
-        Variable groups by analytical dimension.
-    """
-    return {
-        'Target': ['Attrition'],
-        'Psychometric — Satisfaction': [
-            'JobSatisfaction', 'EnvironmentSatisfaction', 'RelationshipSatisfaction'
-        ],
-        'Psychometric — Engagement': [
-            'JobInvolvement', 'WorkLifeBalance'
-        ],
-        'Workload & Strain': [
-            'OverTime', 'BusinessTravel', 'DistanceFromHome'
-        ],
-        'Career Development': [
-            'YearsSinceLastPromotion', 'TrainingTimesLastYear',
-            'PercentSalaryHike', 'StockOptionLevel'
-        ],
-        'Organizational Tenure': [
-            'YearsAtCompany', 'YearsInCurrentRole',
-            'YearsWithCurrManager', 'TotalWorkingYears'
-        ],
-        'Compensation': [
-            'MonthlyIncome', 'DailyRate', 'HourlyRate', 'MonthlyRate'
-        ],
-        'Structural': [
-            'Department', 'JobRole', 'JobLevel'
-        ],
-        'Demographic': [
-            'Age', 'Gender', 'MaritalStatus', 'EducationField', 'Education'
-        ],
-        'Background': [
-            'NumCompaniesWorked', 'PerformanceRating'
-        ]
-    }
+    if analysis_data["AgeBand"].isna().any():
+        raise ValueError("At least one employee was not assigned to an age band.")
+    return analysis_data

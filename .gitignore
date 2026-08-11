@@ -3,6 +3,8 @@ __pycache__/
 *.py[cod]
 *.pyo
 .pytest_cache/
+pytest-cache-files-*/
+.coverage
 
 # Local virtual environments
 .venv/
@@ -11,10 +13,16 @@ env/
 
 # Jupyter local state
 .ipynb_checkpoints/
+.jupyter_cache/
+
+# Quarto execution cache and local render state
+analysis/_freeze/
+analysis/.jupyter_cache/
 
 # Local IDE / assistant state
 .vscode/
 .positai/
+.positron/
 
 # OS files
 Thumbs.db
