@@ -1,369 +1,534 @@
-import streamlit as st
-import pandas as pd
-import numpy as np
+"""Streamlit companion for the frozen People Analytics Quarto analysis."""
+
+from pathlib import Path
+import sys
+
 import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
 import seaborn as sns
-import shap
-import xgboost as xgb
-from sklearn.preprocessing import StandardScaler
-from sklearn.cluster import KMeans
-from sklearn.model_selection import train_test_split
-import warnings
-warnings.filterwarnings('ignore')
+import streamlit as st
+from sklearn.metrics import average_precision_score, brier_score_loss, roc_auc_score
 
-# --- Configuración de página ---
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from src.modeling import (  # noqa: E402
+    ATTITUDE_INDICATORS,
+    BEHAVIORAL_PREDICTORS,
+    COMBINED_PREDICTORS,
+    CONTEXTUAL_PREDICTORS,
+    DEVELOPMENT_REFERENCE_METRICS,
+    MODEL_COMPARISON_RESULTS,
+    REPORTING_THRESHOLD,
+    SENSITIVE_AUDIT_VARIABLES,
+    calculate_threshold_metrics,
+    fit_frozen_model,
+)
+from src.preprocessing import (  # noqa: E402
+    AMBIGUOUS_RATE_COLUMNS,
+    CONSTANT_COLUMNS,
+    IDENTIFIER_COLUMN,
+    TARGET_BINARY_COLUMN,
+    add_analysis_fields,
+    load_data,
+)
+
+
+DATA_PATH = PROJECT_ROOT / "data" / "raw" / "HR-Employee-Attrition.csv"
+REPORT_PATH = PROJECT_ROOT / "analysis" / "people_analytics_attrition.html"
+RETENTION_COLOR = "#2E86AB"
+ATTRITION_COLOR = "#E84855"
+CONTEXT_COLOR = "#7D3C98"
+
 st.set_page_config(
-    page_title="People Analytics — Attrition Dashboard",
+    page_title="People Analytics — Attrition Evidence",
     page_icon="📊",
-    layout="wide"
+    layout="wide",
 )
+sns.set_theme(style="whitegrid", context="notebook")
+plt.close("all")
 
-# --- Estilos globales ---
-sns.set_theme(style='whitegrid', palette='muted', font_scale=0.8)
-plt.rcParams['figure.dpi'] = 90
 
-# --- Carga y procesamiento de datos ---
 @st.cache_data
-def load_and_prepare_data():
-    df = pd.read_csv('../data/raw/HR-Employee-Attrition.csv')
-    df.drop(columns=['EmployeeCount', 'Over18', 'StandardHours'], inplace=True)
-    df['AttritionBinary'] = (df['Attrition'] == 'Yes').astype(int)
-    df['OverTimeBinary'] = (df['OverTime'] == 'Yes').astype(int)
-    return df
+def load_analysis_data() -> pd.DataFrame:
+    """Load the validated source and add audit-only analysis fields."""
+    return add_analysis_fields(load_data(DATA_PATH))
 
-# --- Clustering ---
+
 @st.cache_resource
-def run_clustering(df):
-    clustering_vars = [
-        'JobSatisfaction', 'EnvironmentSatisfaction',
-        'RelationshipSatisfaction', 'JobInvolvement',
-        'WorkLifeBalance', 'OverTimeBinary'
+def train_frozen_result(data: pd.DataFrame):
+    """Reproduce the development fit and one frozen held-out evaluation."""
+    return fit_frozen_model(data)
+
+
+def category_attrition_summary(
+    data: pd.DataFrame,
+    category: str,
+) -> pd.DataFrame:
+    """Return bounded descriptive attrition rates for a categorical field."""
+    return (
+        data.groupby(category, observed=True)
+        .agg(
+            employees=(TARGET_BINARY_COLUMN, "size"),
+            attrition_cases=(TARGET_BINARY_COLUMN, "sum"),
+            attrition_rate=(TARGET_BINARY_COLUMN, "mean"),
+        )
+        .reset_index()
+        .sort_values("attrition_rate", ascending=False)
+    )
+
+
+def subgroup_performance(
+    audit_data: pd.DataFrame,
+    attribute: str,
+) -> pd.DataFrame:
+    """Calculate held-out performance by an audit-only attribute."""
+    rows = []
+    for subgroup, group in audit_data.groupby(attribute, observed=True):
+        observed = group[TARGET_BINARY_COLUMN].to_numpy()
+        probabilities = group["PredictedProbability"].to_numpy()
+        threshold_metrics = calculate_threshold_metrics(
+            observed,
+            probabilities,
+            REPORTING_THRESHOLD,
+        )
+        positive_cases = int(observed.sum())
+        negative_cases = int(len(observed) - positive_cases)
+        has_both_classes = np.unique(observed).size == 2
+
+        if len(observed) < 50 or min(positive_cases, negative_cases) < 5:
+            reliability = "Very limited"
+        elif min(positive_cases, negative_cases) < 20:
+            reliability = "Limited"
+        else:
+            reliability = "More stable"
+
+        rows.append(
+            {
+                "Subgroup": str(subgroup),
+                "Employees": len(observed),
+                "Attrition cases": positive_cases,
+                "Observed rate": observed.mean(),
+                "Mean predicted": probabilities.mean(),
+                "Calibration gap": probabilities.mean() - observed.mean(),
+                "Average Precision": (
+                    average_precision_score(observed, probabilities)
+                    if has_both_classes
+                    else np.nan
+                ),
+                "ROC-AUC": (
+                    roc_auc_score(observed, probabilities)
+                    if has_both_classes
+                    else np.nan
+                ),
+                "Brier score": brier_score_loss(observed, probabilities),
+                "Flag rate": threshold_metrics["flagged_rate"],
+                "Precision": threshold_metrics["precision"],
+                "Recall": threshold_metrics["recall"],
+                "False-positive rate": threshold_metrics["false_positive_rate"],
+                "Reliability": reliability,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+data = load_analysis_data()
+frozen_result = train_frozen_result(data)
+
+st.title("People Analytics: Behavioral Indicators and Attrition")
+st.caption(
+    "Interactive companion to a reproducible behavioral data science analysis"
+)
+st.info(
+    "This dashboard uses a synthetic educational dataset. It describes associations "
+    "and frozen-model validation; it does not identify causes, recommend employment "
+    "actions, or provide employee-level risk scores."
+)
+
+section = st.sidebar.radio(
+    "Explore",
+    [
+        "Evidence overview",
+        "Behavioral evidence",
+        "Model validation",
+        "Responsible-use audit",
+        "Methods and limitations",
+    ],
+)
+st.sidebar.caption("Model: combined L2 logistic regression · C=1")
+st.sidebar.caption(f"Descriptive reporting threshold: {REPORTING_THRESHOLD:.2f}")
+
+
+if section == "Evidence overview":
+    st.header("Evidence overview")
+    total_employees = len(data)
+    attrition_cases = int(data[TARGET_BINARY_COLUMN].sum())
+    attrition_rate = data[TARGET_BINARY_COLUMN].mean()
+    test_metrics = frozen_result.probability_metrics
+
+    metric_columns = st.columns(4)
+    metric_columns[0].metric("Employees", f"{total_employees:,}")
+    metric_columns[1].metric(
+        "Observed attrition",
+        f"{attrition_rate:.1%}",
+        help=f"{attrition_cases} observed cases in the complete synthetic sample.",
+    )
+    metric_columns[2].metric(
+        "Held-out Average Precision",
+        f"{test_metrics['Average Precision']:.3f}",
+        help="Primary threshold-free metric; test prevalence is 0.160.",
+    )
+    metric_columns[3].metric(
+        "Held-out ROC-AUC",
+        f"{test_metrics['ROC-AUC']:.3f}",
+        help="Secondary ranking metric from the one frozen test evaluation.",
+    )
+
+    st.subheader("Observed attrition varies across job-demand conditions")
+    overtime_summary = category_attrition_summary(data, "OverTime")
+    travel_summary = category_attrition_summary(data, "BusinessTravel")
+
+    figure, axes = plt.subplots(1, 2, figsize=(12, 4.5))
+    axes[0].bar(
+        overtime_summary["OverTime"],
+        overtime_summary["attrition_rate"] * 100,
+        color=[ATTRITION_COLOR, RETENTION_COLOR],
+    )
+    axes[0].set_title("Overtime")
+    axes[0].set_ylabel("Observed attrition rate (%)")
+    axes[0].set_ylim(0, 35)
+    for position, value in enumerate(overtime_summary["attrition_rate"] * 100):
+        axes[0].text(position, value + 0.7, f"{value:.1f}%", ha="center")
+
+    travel_plot = travel_summary.sort_values("attrition_rate")
+    axes[1].barh(
+        travel_plot["BusinessTravel"].str.replace("_", " "),
+        travel_plot["attrition_rate"] * 100,
+        color=[RETENTION_COLOR, "#F5A05A", ATTRITION_COLOR],
+    )
+    axes[1].set_title("Business travel")
+    axes[1].set_xlabel("Observed attrition rate (%)")
+    axes[1].set_xlim(0, 30)
+    for position, value in enumerate(travel_plot["attrition_rate"] * 100):
+        axes[1].text(value + 0.5, position, f"{value:.1f}%", va="center")
+
+    figure.tight_layout()
+    st.pyplot(figure, width="stretch")
+    plt.close(figure)
+    st.caption(
+        "These are bivariate observed rates. Job role, compensation, tenure, and other "
+        "conditions may confound the comparisons."
+    )
+
+    st.subheader("What the analysis supports")
+    st.markdown(
+        """
+        - Behavioral and contextual predictors each contain out-of-sample signal.
+        - Their combined logistic model consistently outperforms either block alone.
+        - Nested XGBoost does not improve discrimination or probability quality.
+        - Held-out performance is promising but uncertain and does not establish causal effects.
+        """
+    )
+
+
+elif section == "Behavioral evidence":
+    st.header("Behavioral and organizational evidence")
+    st.warning(
+        "The five attitude variables are single four-level indicators, not validated "
+        "psychometric scales."
+    )
+
+    selected_indicator = st.selectbox(
+        "Attitude indicator",
+        ATTITUDE_INDICATORS,
+    )
+    distribution = (
+        data.groupby([selected_indicator, "Attrition"], observed=True)
+        .size()
+        .groupby(level=1)
+        .transform(lambda values: values / values.sum() * 100)
+        .rename("Percentage")
+        .reset_index()
+    )
+
+    left_column, right_column = st.columns([1.35, 1])
+    with left_column:
+        figure, axis = plt.subplots(figsize=(7, 4.5))
+        sns.barplot(
+            data=distribution,
+            x=selected_indicator,
+            y="Percentage",
+            hue="Attrition",
+            hue_order=["No", "Yes"],
+            palette=[RETENTION_COLOR, ATTRITION_COLOR],
+            ax=axis,
+        )
+        axis.set_xlabel("Response level")
+        axis.set_ylabel("Employees within outcome group (%)")
+        axis.set_title(f"{selected_indicator} distribution by observed attrition")
+        axis.legend(title="Observed attrition")
+        figure.tight_layout()
+        st.pyplot(figure, width="stretch")
+        plt.close(figure)
+
+    with right_column:
+        indicator_summary = (
+            data.groupby("Attrition")[selected_indicator]
+            .agg(["count", "mean", "median", "std"])
+            .rename_axis("Observed attrition")
+        )
+        st.subheader("Group summary")
+        st.dataframe(indicator_summary.round(3), width="stretch")
+        st.markdown(
+            "Employees who left report lower means across all five indicators, but "
+            "the distributions overlap substantially. No item is an individual diagnostic."
+        )
+
+    st.subheader("Organizational categories")
+    selected_category = st.selectbox(
+        "Category",
+        ["JobRole", "Department", "EducationField"],
+    )
+    category_summary = category_attrition_summary(data, selected_category)
+    st.dataframe(
+        category_summary.assign(
+            attrition_rate=lambda frame: frame["attrition_rate"].map(
+                lambda value: f"{value:.1%}"
+            )
+        ),
+        width="stretch",
+        hide_index=True,
+    )
+    st.caption(
+        "Small categories produce unstable rates. These comparisons are descriptive "
+        "and involve multiple groups."
+    )
+
+
+elif section == "Model validation":
+    st.header("Frozen model validation")
+    st.markdown(
+        "The primary model is a combined 24-predictor L2 logistic regression. "
+        "Preprocessing is fitted inside training folds; identifiers and sensitive "
+        "attributes are excluded."
+    )
+
+    comparison_column, metric_column = st.columns([1.4, 1])
+    with comparison_column:
+        st.subheader("Development model comparison")
+        model_order = MODEL_COMPARISON_RESULTS["Model"].tolist()
+        figure, axis = plt.subplots(figsize=(8, 4.5))
+        axis.barh(
+            model_order,
+            MODEL_COMPARISON_RESULTS["Average Precision"],
+            color=["#AAB7B8", RETENTION_COLOR, CONTEXT_COLOR, ATTRITION_COLOR, "#D68910"],
+        )
+        axis.axvline(0.162, color="#566573", linestyle="--", linewidth=1)
+        axis.set_xlim(0, 0.72)
+        axis.set_xlabel("Mean validation Average Precision")
+        axis.invert_yaxis()
+        for position, value in enumerate(MODEL_COMPARISON_RESULTS["Average Precision"]):
+            axis.text(value + 0.01, position, f"{value:.3f}", va="center")
+        figure.tight_layout()
+        st.pyplot(figure, width="stretch")
+        plt.close(figure)
+
+    with metric_column:
+        st.subheader("Final held-out metrics")
+        st.metric("Average Precision", f"{frozen_result.probability_metrics['Average Precision']:.3f}")
+        st.metric("ROC-AUC", f"{frozen_result.probability_metrics['ROC-AUC']:.3f}")
+        st.metric("Brier score", f"{frozen_result.probability_metrics['Brier score']:.3f}")
+        st.metric("Log loss", f"{frozen_result.probability_metrics['Log loss']:.3f}")
+
+    st.subheader("Development-to-test generalization")
+    generalization_table = pd.DataFrame(
+        [
+            {
+                "Metric": metric,
+                "Development OOF": development_value,
+                "Held-out test": frozen_result.probability_metrics[metric],
+                "Test minus development": (
+                    frozen_result.probability_metrics[metric] - development_value
+                ),
+            }
+            for metric, development_value in DEVELOPMENT_REFERENCE_METRICS.items()
+        ]
+    )
+    st.dataframe(generalization_table.round(3), width="stretch", hide_index=True)
+
+    st.subheader(f"Descriptive threshold transfer at {REPORTING_THRESHOLD:.2f}")
+    threshold_metrics = frozen_result.threshold_metrics
+    confusion_matrix = np.array(
+        [
+            [threshold_metrics["true_negative"], threshold_metrics["false_positive"]],
+            [threshold_metrics["false_negative"], threshold_metrics["true_positive"]],
+        ]
+    )
+    matrix_column, threshold_column = st.columns([1.1, 1])
+    with matrix_column:
+        figure, axis = plt.subplots(figsize=(5.5, 4.2))
+        sns.heatmap(
+            confusion_matrix,
+            annot=True,
+            fmt="d",
+            cmap="Blues",
+            cbar=False,
+            xticklabels=["Predicted stayed", "Flagged"],
+            yticklabels=["Observed stayed", "Observed left"],
+            ax=axis,
+        )
+        axis.set_xlabel("")
+        axis.set_ylabel("")
+        figure.tight_layout()
+        st.pyplot(figure, width="stretch")
+        plt.close(figure)
+    with threshold_column:
+        st.metric("Employees flagged", f"{threshold_metrics['flagged_employees']} / 294")
+        st.metric("Precision", f"{threshold_metrics['precision']:.3f}")
+        st.metric("Recall", f"{threshold_metrics['recall']:.3f}")
+        st.metric("Specificity", f"{threshold_metrics['specificity']:.3f}")
+        st.caption(
+            "The threshold maximized F1 in development. It is included for descriptive "
+            "transfer only and is not an operational employment rule."
+        )
+
+
+elif section == "Responsible-use audit":
+    st.header("Responsible-use and subgroup audit")
+    st.markdown(
+        "Age, gender, and marital status were attached only after held-out predictions "
+        "were generated. They never entered model fitting."
+    )
+
+    audit_data = frozen_result.test_data.copy()
+    audit_data["PredictedProbability"] = frozen_result.test_probabilities
+    audit_attribute = st.selectbox(
+        "Audit attribute",
+        ["AgeBand", "Gender", "MaritalStatus"],
+    )
+    audit_summary = subgroup_performance(audit_data, audit_attribute)
+
+    figure, axis = plt.subplots(figsize=(9, 4.8))
+    x_positions = np.arange(len(audit_summary))
+    axis.plot(
+        x_positions,
+        audit_summary["Observed rate"],
+        marker="o",
+        linewidth=2,
+        color=ATTRITION_COLOR,
+        label="Observed rate",
+    )
+    axis.plot(
+        x_positions,
+        audit_summary["Mean predicted"],
+        marker="o",
+        linewidth=2,
+        color=RETENTION_COLOR,
+        label="Mean predicted",
+    )
+    axis.set_xticks(x_positions, audit_summary["Subgroup"], rotation=20)
+    axis.set_ylabel("Probability / observed rate")
+    axis.set_title(f"Held-out calibration by {audit_attribute}")
+    axis.legend()
+    figure.tight_layout()
+    st.pyplot(figure, width="stretch")
+    plt.close(figure)
+
+    percentage_columns = [
+        "Observed rate",
+        "Mean predicted",
+        "Calibration gap",
+        "Flag rate",
+        "Precision",
+        "Recall",
+        "False-positive rate",
     ]
-    scaler = StandardScaler()
-    df_scaled = scaler.fit_transform(df[clustering_vars])
-    kmeans = KMeans(n_clusters=4, random_state=42, n_init=10)
-    df['Cluster'] = kmeans.fit_predict(df_scaled)
-    profile_names = {
-        0: 'Strained but Present',
-        1: 'Structurally Stable, Relationally Distant',
-        2: 'Overloaded at Risk',
-        3: 'Engaged and Balanced'
-    }
-    df['Profile'] = df['Cluster'].map(profile_names)
-    return df, scaler, kmeans
+    display_audit = audit_summary.copy()
+    display_audit[percentage_columns] = display_audit[percentage_columns].round(3)
+    st.dataframe(display_audit, width="stretch", hide_index=True)
 
-# --- Modelo predictivo ---
-@st.cache_resource
-def train_model(df):
-    df_model = pd.get_dummies(df.drop(columns=['Attrition', 'Profile']), drop_first=True)
-    X = df_model.drop(columns=['AttritionBinary'])
-    y = df_model['AttritionBinary']
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=42, stratify=y
+    very_limited = audit_summary.loc[
+        audit_summary["Reliability"] == "Very limited", "Subgroup"
+    ].tolist()
+    if very_limited:
+        st.warning(
+            "Very limited evidence for: " + ", ".join(very_limited) + ". "
+            "These groups need more observations and attrition cases before comparison."
+        )
+    st.caption(
+        "This sample cannot establish legal or deployment fairness. Different base "
+        "rates also prevent one threshold from equalizing every performance metric."
     )
-    scale_pos_weight = (y_train == 0).sum() / (y_train == 1).sum()
-    model = xgb.XGBClassifier(
-        n_estimators=300, max_depth=4, learning_rate=0.05,
-        subsample=0.8, colsample_bytree=0.8,
-        scale_pos_weight=scale_pos_weight,
-        random_state=42, verbosity=0
+
+
+else:
+    st.header("Methods and limitations")
+    st.subheader("Frozen predictor specification")
+    predictor_columns = st.columns(2)
+    with predictor_columns[0]:
+        st.markdown(f"**Behavioral block — {len(BEHAVIORAL_PREDICTORS)} predictors**")
+        st.code("\n".join(BEHAVIORAL_PREDICTORS), language=None)
+    with predictor_columns[1]:
+        st.markdown(f"**Contextual block — {len(CONTEXTUAL_PREDICTORS)} predictors**")
+        st.code("\n".join(CONTEXTUAL_PREDICTORS), language=None)
+
+    st.subheader("Explicit exclusions")
+    exclusion_table = pd.DataFrame(
+        {
+            "Role": [
+                "Identifier",
+                "Constant metadata",
+                "Ambiguous rate variables",
+                "Sensitive audit only",
+            ],
+            "Variables": [
+                IDENTIFIER_COLUMN,
+                ", ".join(CONSTANT_COLUMNS),
+                ", ".join(AMBIGUOUS_RATE_COLUMNS),
+                ", ".join(SENSITIVE_AUDIT_VARIABLES),
+            ],
+        }
     )
-    model.fit(X_train, y_train)
-    explainer = shap.TreeExplainer(model)
-    return model, explainer, X, X_test
+    st.dataframe(exclusion_table, width="stretch", hide_index=True)
 
-# --- SHAP cacheado ---
-@st.cache_resource
-def compute_shap_values(_explainer, _X_full):
-    return _explainer.shap_values(_X_full)
+    st.subheader("Validation design")
+    st.markdown(
+        """
+        1. Stable 80/20 stratified development/test split using the identifier only for partition integrity.
+        2. Five-fold stratified cross-validation repeated five times inside development.
+        3. Fold-specific imputation, standardization, and one-hot encoding.
+        4. Average Precision as the primary selection metric; probability quality checked with Brier and log loss.
+        5. Nested cross-validation for XGBoost and one final frozen test evaluation.
+        6. Sensitive attributes reserved for post-prediction auditing.
+        """
+    )
 
-# --- Ejecutar todo ---
-df = load_and_prepare_data()
-df, scaler, kmeans = run_clustering(df)
-model, explainer, X, X_test = train_model(df)
+    st.subheader("Material limitations")
+    st.markdown(
+        """
+        - Synthetic, cross-sectional data do not establish temporal or external validity.
+        - Associations and coefficients are not causal effects.
+        - Attitude variables are single ordinal items, not validated psychological scales.
+        - Several held-out subgroups contain too few attrition cases for stable fairness metrics.
+        - The 0.32 threshold has no intervention-cost or capacity justification.
+        - No employee-level prediction should be used for hiring, discipline, promotion, or termination.
+        """
+    )
 
-# ============================================================
-# HEADER
-# ============================================================
-st.title("📊 People Analytics: Behavioral Risk Profiling")
-st.markdown(
-    "**Dataset:** IBM HR Analytics · 1,470 employees · 35 variables  \n"
-    "**Model:** XGBoost + SHAP · AUC-ROC: 0.763  \n"
-    "**Segmentation:** K-Means behavioral clustering (k=4)"
-)
-st.divider()
+    if REPORT_PATH.is_file():
+        st.download_button(
+            "Download the full rendered analysis",
+            data=REPORT_PATH.read_bytes(),
+            file_name=REPORT_PATH.name,
+            mime="text/html",
+        )
 
-# ============================================================
-# SECCIÓN 1 — MÉTRICAS GLOBALES
-# ============================================================
-st.header("🏢 Workforce Overview")
-
-total = len(df)
-attrition_rate = df['AttritionBinary'].mean() * 100
-high_risk = (df['Profile'] == 'Overloaded at Risk').sum()
-stable = (df['Profile'] == 'Engaged and Balanced').sum()
-
-col1, col2, col3, col4 = st.columns(4)
-with col1:
-    st.metric("Total Employees", f"{total:,}")
-with col2:
-    st.metric("Overall Attrition Rate", f"{attrition_rate:.1f}%",
-              delta="-vs 20% industry avg", delta_color="normal")
-with col3:
-    st.metric("Overloaded at Risk", f"{high_risk:,}",
-              delta=f"{high_risk/total*100:.1f}% of workforce",
-              delta_color="inverse")
-with col4:
-    st.metric("Engaged & Balanced", f"{stable:,}",
-              delta=f"{stable/total*100:.1f}% of workforce",
-              delta_color="normal")
-
-st.divider()
-
-# ============================================================
-# SECCIÓN 1 — GRÁFICOS DE OVERVIEW
-# ============================================================
-profile_order = [
-    'Engaged and Balanced',
-    'Structurally Stable, Relationally Distant',
-    'Strained but Present',
-    'Overloaded at Risk'
-]
-colors = ['#2ecc71', '#3498db', '#f39c12', '#e74c3c']
-
-_, col_left, col_right, _ = st.columns([0.5, 3, 2, 0.5])
-
-with col_left:
-    st.subheader("Attrition Rate by Behavioral Profile")
-    attrition_by_profile = (
-        df.groupby('Profile')['AttritionBinary']
-        .mean() * 100
-    ).reindex(profile_order)
-
-    fig, ax = plt.subplots(figsize=(5, 2.8))
-    bars = ax.barh(attrition_by_profile.index,
-                   attrition_by_profile.values,
-                   color=colors, edgecolor='white', height=0.5)
-    ax.axvline(x=16.1, color='gray', linestyle='--',
-               linewidth=1.2, label='Global baseline (16.1%)')
-    ax.set_xlabel('Attrition rate (%)', fontsize=8)
-    ax.set_xlim(0, 40)
-    ax.legend(fontsize=7)
-    ax.tick_params(labelsize=7)
-    for bar, val in zip(bars, attrition_by_profile.values):
-        ax.text(val + 0.5, bar.get_y() + bar.get_height() / 2,
-                f'{val:.1f}%', va='center', fontweight='bold', fontsize=8)
-    fig.tight_layout()
-    st.pyplot(fig, use_container_width=False)
-    plt.close()
-
-with col_right:
-    st.subheader("Employees per Profile")
-    count_by_profile = df['Profile'].value_counts().reindex(profile_order)
-
-    fig2, ax2 = plt.subplots(figsize=(3.5, 2.8))
-    ax2.barh(count_by_profile.index, count_by_profile.values,
-             color=colors, edgecolor='white', height=0.5)
-    ax2.set_xlabel('Number of employees', fontsize=8)
-    ax2.tick_params(labelsize=7)
-    for i, val in enumerate(count_by_profile.values):
-        ax2.text(val + 3, i, str(val), va='center', fontsize=8)
-    fig2.tight_layout()
-    st.pyplot(fig2, use_container_width=False)
-    plt.close()
 
 st.divider()
-
-# ============================================================
-# SECCIÓN 2 — EXPLORADOR DE PERFILES
-# ============================================================
-st.header("🔍 Behavioral Profile Explorer")
-
-profile_colors = {
-    'Engaged and Balanced': '#2ecc71',
-    'Structurally Stable, Relationally Distant': '#3498db',
-    'Strained but Present': '#f39c12',
-    'Overloaded at Risk': '#e74c3c'
-}
-
-profile_descriptions = {
-    'Engaged and Balanced': (
-        "The most stable profile. Employees in this group report high relationship "
-        "satisfaction and work-life balance, with zero overtime. They represent the "
-        "organizational ideal and the lowest attrition risk (8.5%). Retention strategy: "
-        "maintain current conditions and use as cultural benchmark."
-    ),
-    'Structurally Stable, Relationally Distant': (
-        "Low attrition (10.6%) despite the lowest relationship satisfaction in the dataset. "
-        "Zero overtime and good work-life balance compensate for interpersonal distance. "
-        "Vulnerable if structural conditions deteriorate. Intervention: relationship-building "
-        "initiatives without disrupting workload balance."
-    ),
-    'Strained but Present': (
-        "Average attrition rate (16.2%) with the lowest perceived work-life balance (1.71/4) "
-        "despite minimal overtime. The source of strain is not captured in formal workload "
-        "metrics — suggesting informal pressure or unmeasured demands. "
-        "Intervention: qualitative investigation of strain sources."
-    ),
-    'Overloaded at Risk': (
-        "Highest attrition rate (29.7%) — nearly double the global baseline. "
-        "Defined almost entirely by 100% overtime prevalence. Satisfaction and engagement "
-        "scores are similar to other profiles; this group does not leave because they "
-        "dislike their work — they leave because of structural overload. "
-        "Intervention: workload reduction and overtime policy review."
-    )
-}
-
-selected_profile = st.selectbox(
-    "Select a behavioral profile:",
-    options=list(profile_colors.keys())
-)
-
-profile_df = df[df['Profile'] == selected_profile]
-profile_color = profile_colors[selected_profile]
-
-_, col_info, col_radar, _ = st.columns([0.5, 2, 2.5, 0.5])
-
-with col_info:
-    st.markdown(f"### {selected_profile}")
-    st.markdown(f"**Attrition rate:** {profile_df['AttritionBinary'].mean()*100:.1f}%")
-    st.markdown(f"**Employees:** {len(profile_df):,} ({len(profile_df)/len(df)*100:.1f}% of workforce)")
-    st.markdown("---")
-    st.markdown(profile_descriptions[selected_profile])
-    st.markdown("**Key metrics:**")
-    m1, m2 = st.columns(2)
-    with m1:
-        st.metric("Avg Monthly Income", f"${profile_df['MonthlyIncome'].mean():,.0f}")
-        st.metric("Avg Age", f"{profile_df['Age'].mean():.1f} yrs")
-    with m2:
-        st.metric("Overtime %", f"{profile_df['OverTimeBinary'].mean()*100:.0f}%")
-        st.metric("Avg Tenure", f"{profile_df['YearsAtCompany'].mean():.1f} yrs")
-
-with col_radar:
-    clustering_vars = [
-        'JobSatisfaction', 'EnvironmentSatisfaction',
-        'RelationshipSatisfaction', 'JobInvolvement',
-        'WorkLifeBalance', 'OverTimeBinary'
-    ]
-    labels = [
-        'Job\nSatisfaction', 'Environment\nSatisfaction',
-        'Relationship\nSatisfaction', 'Job\nInvolvement',
-        'Work-Life\nBalance', 'OverTime'
-    ]
-    values = profile_df[clustering_vars].mean().values.tolist()
-    max_vals = [4, 4, 4, 4, 4, 1]
-    values_norm = [v / m for v, m in zip(values, max_vals)]
-    values_norm += values_norm[:1]
-    angles = [n / float(len(labels)) * 2 * np.pi for n in range(len(labels))]
-    angles += angles[:1]
-
-    fig3, ax3 = plt.subplots(figsize=(4, 4), subplot_kw=dict(polar=True))
-    ax3.plot(angles, values_norm, 'o-', linewidth=2, color=profile_color)
-    ax3.fill(angles, values_norm, alpha=0.25, color=profile_color)
-    ax3.set_xticks(angles[:-1])
-    ax3.set_xticklabels(labels, fontsize=7)
-    ax3.set_ylim(0, 1)
-    ax3.set_yticks([0.25, 0.5, 0.75, 1.0])
-    ax3.set_yticklabels(['25%', '50%', '75%', '100%'], fontsize=6)
-    ax3.set_title(f'Behavioral Profile — {selected_profile}',
-                  fontweight='bold', pad=15, fontsize=8)
-    fig3.tight_layout()
-    st.pyplot(fig3, use_container_width=False)
-    plt.close()
-
-st.divider()
-
-# ============================================================
-# SECCIÓN 3 — INDIVIDUAL RISK EXPLORER
-# ============================================================
-st.header("👤 Individual Risk Explorer")
-st.markdown("Select an employee to see their predicted attrition probability and SHAP explanation.")
-
-df_model_full = pd.get_dummies(
-    df.drop(columns=['Attrition', 'Profile']), drop_first=True
-)
-X_full = df_model_full.drop(columns=['AttritionBinary'])
-X_full = X_full.reindex(columns=X.columns, fill_value=0)
-all_probs = model.predict_proba(X_full)[:, 1]
-df['AttritionProb'] = all_probs
-
-shap_values_full = compute_shap_values(explainer, X_full)
-
-employee_idx = st.slider(
-    "Select employee index:",
-    min_value=0,
-    max_value=len(df) - 1,
-    value=0,
-    step=1
-)
-
-employee = df.iloc[employee_idx]
-emp_prob = employee['AttritionProb']
-emp_profile = employee['Profile']
-emp_actual = employee['Attrition']
-
-_, col_emp, col_waterfall, _ = st.columns([0.5, 1.5, 3, 0.5])
-
-with col_emp:
-    st.markdown(f"### Employee #{employee_idx}")
-    risk_label = (
-        "🔴 High Risk" if emp_prob >= 0.5
-        else "🟡 Moderate Risk" if emp_prob >= 0.25
-        else "🟢 Low Risk"
-    )
-    st.markdown(f"**Attrition Probability:** {emp_prob*100:.1f}%")
-    st.progress(float(emp_prob))
-    st.markdown(f"**Risk Level:** {risk_label}")
-    st.markdown(f"**Actual Outcome:** {'Left ❌' if emp_actual == 'Yes' else 'Stayed ✅'}")
-    st.markdown(f"**Behavioral Profile:** {emp_profile}")
-    st.divider()
-    st.markdown("**Employee characteristics:**")
-    chars = {
-        'Age': int(employee['Age']),
-        'Department': employee['Department'],
-        'Job Role': employee['JobRole'],
-        'Monthly Income': f"${employee['MonthlyIncome']:,}",
-        'Overtime': employee['OverTime'],
-        'Years at Company': int(employee['YearsAtCompany']),
-        'Work-Life Balance': f"{int(employee['WorkLifeBalance'])}/4",
-        'Job Satisfaction': f"{int(employee['JobSatisfaction'])}/4",
-    }
-    for key, val in chars.items():
-        st.markdown(f"- **{key}:** {val}")
-
-with col_waterfall:
-    st.markdown("### SHAP Explanation")
-    st.markdown("Variables pushing toward attrition **(red)** or retention **(blue)**")
-
-    shap_exp = shap.Explanation(
-        values=shap_values_full[employee_idx],
-        base_values=explainer.expected_value,
-        data=X_full.iloc[employee_idx].values,
-        feature_names=X_full.columns.tolist()
-    )
-
-    fig4, ax4 = plt.subplots(figsize=(6, 4))
-    plt.sca(ax4)
-    shap.plots.waterfall(shap_exp, max_display=10, show=False)
-    ax4.set_title(
-        f'Employee #{employee_idx} — Risk: {emp_prob*100:.1f}% | Actual: {emp_actual}',
-        fontweight='bold', fontsize=8, pad=10
-    )
-    fig4.tight_layout()
-    st.pyplot(fig4, use_container_width=False)
-    plt.close()
-
-st.divider()
-
-# ============================================================
-# FOOTER
-# ============================================================
-st.markdown(
-    """
-    ---
-    **People Analytics: Behavioral Risk Profiling & Attrition Prediction**  
-    Washington Casamen Nolasco · Psychologist & Behavioral Data Scientist  
-    Dataset: IBM HR Analytics (synthetic, public domain) · Model: XGBoost + SHAP  
-    [GitHub](https://github.com/Washingtonwlad/people-analytics-attrition)
-    """
+st.caption(
+    "Washington Casamen Nolasco · Quantitative Psychology & Behavioral Data Science · "
+    "Synthetic IBM HR Analytics dataset"
 )
