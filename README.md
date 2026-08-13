@@ -13,6 +13,12 @@ The central question is deliberately limited:
 
 This is an educational portfolio project, not an operational HR decision system. It does not infer causes, prescribe interventions, or generate employee-level recommendations.
 
+## Live Report
+
+**Published Quarto report:** [washingtonwlad.github.io/people-analytics-attrition](https://washingtonwlad.github.io/people-analytics-attrition/)
+
+The report contains the full analytical pipeline, including exploratory descriptive evidence, leakage-safe nested cross-validation, probability calibration, threshold trade-off analysis, and post-prediction subgroup auditing across age, gender, and marital status.
+
 ## Main results
 
 The analysis uses 1,470 synthetic employee records with 237 observed attrition cases (16.1%). A stratified 20% test set is held out until the model specification and reporting threshold are frozen.
